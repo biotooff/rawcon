@@ -389,8 +389,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 			loopLayer := packet.Layer(layers.LayerTypeLoopback)
 			if ethLayer != nil {
 				eth, _ = ethLayer.(*layers.Ethernet)
-			}
-			if loopLayer == nil {
+			} else if loopLayer == nil {
 				return
 			}
 		}
