@@ -54,7 +54,8 @@ func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 			return
 		}
 		ethLayer := packet.Layer(layers.LayerTypeEthernet)
-		if ethLayer == nil {
+		loopLayer := packet.Layer(layers.LayerTypeLoopback)
+		if ethLayer == nil && loopLayer == nil {
 			continue
 		}
 		eth, _ := ethLayer.(*layers.Ethernet)
@@ -101,9 +102,15 @@ func (conn *RAWConn) sendPacket() (err error) {
 	layer := conn.layer
 	layer.ip4.Id++
 	layer.tcp.SetNetworkLayerForChecksum(layer.ip4)
-	err = gopacket.SerializeLayers(buffer, opts,
-		layer.eth, layer.ip4,
-		layer.tcp, gopacket.Payload(layer.tcp.Payload))
+	if layer.eth != nil {
+		err = gopacket.SerializeLayers(buffer, opts,
+			layer.eth, layer.ip4,
+			layer.tcp, gopacket.Payload(layer.tcp.Payload))
+	} else {
+		err = gopacket.SerializeLayers(buffer, opts,
+			&layers.Loopback{Family: layers.ProtocolFamilyIPv4}, layer.ip4,
+			layer.tcp, gopacket.Payload(layer.tcp.Payload))
+	}
 	if err == nil {
 		err = conn.handle.WritePacketData(buffer.Bytes())
 	}
@@ -347,40 +354,48 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 	if err != nil {
 		return
 	}
-	buf := make([]byte, 32)
-	binary.Read(rand.Reader, binary.LittleEndian, buf)
-	uconn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(8, 8, buf[0], buf[1]), Port: int(binary.LittleEndian.Uint16(buf[2:4]))})
-	if err != nil {
-		return
-	}
-	defer uconn.Close()
-	filter := "udp and src port " + strconv.Itoa(uconn.LocalAddr().(*net.UDPAddr).Port) +
-		" and dst host " + uconn.RemoteAddr().(*net.UDPAddr).IP.String() +
-		" and dst port " + strconv.Itoa(uconn.RemoteAddr().(*net.UDPAddr).Port)
-	err = handle.SetBPFFilter(filter)
-	if err != nil {
-		return
-	}
 	pktsrc := gopacket.NewPacketSource(handle, handle.LinkType())
 	packets := pktsrc.Packets()
-	_, err = uconn.Write(buf)
-	if err != nil {
-		return
-	}
 	var eth *layers.Ethernet
-	timer := time.NewTimer(time.Second * 2)
-	select {
-	case <-timer.C:
-		err = errors.New("timeout")
-		return
-	case packet := <-packets:
-		ethLayer := packet.Layer(layers.LayerTypeEthernet)
-		if ethLayer == nil {
+	if ulocaladdr.IP.String() != "127.0.0.1" {
+		buf := make([]byte, 32)
+		binary.Read(rand.Reader, binary.LittleEndian, buf)
+		var uconn *net.UDPConn
+		uconn, err = net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(8, 8, buf[0], buf[1]), Port: int(binary.LittleEndian.Uint16(buf[2:4]))})
+		if err != nil {
 			return
 		}
-		eth, _ = ethLayer.(*layers.Ethernet)
+		defer uconn.Close()
+		filter := "udp and src port " + strconv.Itoa(uconn.LocalAddr().(*net.UDPAddr).Port) +
+			" and dst host " + uconn.RemoteAddr().(*net.UDPAddr).IP.String() +
+			" and dst port " + strconv.Itoa(uconn.RemoteAddr().(*net.UDPAddr).Port)
+		err = handle.SetBPFFilter(filter)
+		if err != nil {
+			return
+		}
+
+		_, err = uconn.Write(buf)
+		if err != nil {
+			return
+		}
+
+		timer := time.NewTimer(time.Second * 2)
+		select {
+		case <-timer.C:
+			err = errors.New("timeout")
+			return
+		case packet := <-packets:
+			ethLayer := packet.Layer(layers.LayerTypeEthernet)
+			loopLayer := packet.Layer(layers.LayerTypeLoopback)
+			if ethLayer != nil {
+				eth, _ = ethLayer.(*layers.Ethernet)
+			}
+			if loopLayer == nil {
+				return
+			}
+		}
 	}
-	filter = "tcp and src host " + remoteaddr.String() +
+	filter := "tcp and src host " + remoteaddr.String() +
 		" and src port " + strconv.Itoa(uremoteaddr.Port) +
 		" and dst host " + localaddr.String() +
 		" and dst port " + strconv.Itoa(ulocaladdr.Port)
@@ -572,14 +587,12 @@ func (listener *RAWListener) closeConn(info *connInfo) (err error) {
 }
 
 func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
-	udp, err := net.Dial("udp4", address)
+	udpaddr, err := net.ResolveUDPAddr("udp4", address)
 	if err != nil {
 		return
 	}
-	udpaddr := udp.LocalAddr().(*net.UDPAddr)
-	err = udp.Close()
-	if err != nil {
-		return
+	if udpaddr.IP == nil || udpaddr.IP.Equal(net.IPv4(0, 0, 0, 0)) {
+		udpaddr.IP = net.IPv4(127, 0, 0, 1)
 	}
 	in, err := chooseInterfaceByAddr(udpaddr.IP.String())
 	if err != nil {
@@ -756,31 +769,31 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 			}
 			continue
 		}
-		eth := &layers.Ethernet{
-			DstMAC:       cl.eth.SrcMAC,
-			SrcMAC:       cl.eth.DstMAC,
-			EthernetType: cl.eth.EthernetType,
-		}
-		ip4 := &layers.IPv4{
-			SrcIP:    cl.ip4.DstIP,
-			DstIP:    cl.ip4.SrcIP,
-			Protocol: layers.IPProtocolTCP,
-			Version:  0x4,
-			Id:       uint16(src.Int63() % 65536),
-			Flags:    layers.IPv4DontFragment,
-			TTL:      0x40,
-			TOS:      uint8(listener.r.DSCP),
-		}
-		tcp = &layers.TCP{
-			SrcPort: cl.tcp.DstPort,
-			DstPort: cl.tcp.SrcPort,
-			Window:  32760,
-			Ack:     cl.tcp.Seq + 1,
-		}
 		layer := &pktLayers{
-			eth: eth,
-			ip4: ip4,
-			tcp: tcp,
+			eth: nil,
+			ip4: &layers.IPv4{
+				SrcIP:    cl.ip4.DstIP,
+				DstIP:    cl.ip4.SrcIP,
+				Protocol: layers.IPProtocolTCP,
+				Version:  0x4,
+				Id:       uint16(src.Int63() % 65536),
+				Flags:    layers.IPv4DontFragment,
+				TTL:      0x40,
+				TOS:      uint8(listener.r.DSCP),
+			},
+			tcp: &layers.TCP{
+				SrcPort: cl.tcp.DstPort,
+				DstPort: cl.tcp.SrcPort,
+				Window:  32760,
+				Ack:     cl.tcp.Seq + 1,
+			},
+		}
+		if cl.eth != nil {
+			layer.eth = &layers.Ethernet{
+				DstMAC:       cl.eth.SrcMAC,
+				SrcMAC:       cl.eth.DstMAC,
+				EthernetType: cl.eth.EthernetType,
+			}
 		}
 		if tcp.SYN && !tcp.ACK && !tcp.PSH && !tcp.FIN {
 			info := &connInfo{
