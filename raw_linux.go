@@ -8,6 +8,8 @@ import (
 	"net"
 	"time"
 
+	"github.com/ccsexyz/utils"
+
 	"os/exec"
 	"strconv"
 
@@ -16,18 +18,18 @@ import (
 )
 
 type RAWConn struct {
-	conn  *net.IPConn
-	udp   net.Conn
-	layer *pktLayers
-	buf   []byte
-	clean *exec.Cmd
-	r     *Raw
-	hseqn uint32
+	conn    *net.IPConn
+	udp     net.Conn
+	layer   *pktLayers
+	buf     []byte
+	cleaner *utils.ExitCleaner
+	r       *Raw
+	hseqn   uint32
 }
 
 func (raw *RAWConn) Close() (err error) {
-	if raw.clean != nil {
-		raw.clean.Run()
+	if raw.cleaner != nil {
+		raw.cleaner.Exit()
 	}
 	if raw.udp != nil {
 		raw.sendFin()
@@ -360,15 +362,19 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 	if err != nil {
 		return
 	}
-	raw.clean = exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", "-s", conn.LocalAddr().String(),
+	cleaner := &utils.ExitCleaner{}
+	clean := exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", "-s", conn.LocalAddr().String(),
 		"--sport", strconv.Itoa(ulocaladdr.Port), "-d", conn.RemoteAddr().String(),
 		"--dport", strconv.Itoa(uremoteaddr.Port), "--tcp-flags", "RST", "RST", "-j", "DROP")
+	cleaner.Push(func() {
+		clean.Run()
+	})
 	defer func() {
 		if err != nil {
-			raw.clean.Run()
-			raw.clean = nil
+			cleaner.Exit()
 			return
 		}
+		raw.cleaner = cleaner
 	}()
 	retry := 0
 	layer := raw.layer
@@ -545,8 +551,30 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	if err != nil {
 		return
 	}
-	listener.clean = exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", "-s", conn.LocalAddr().String(),
+	cleaner := &utils.ExitCleaner{}
+	clean1 := exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", "-s", conn.LocalAddr().String(),
 		"--sport", strconv.Itoa(udpaddr.Port), "--tcp-flags", "RST", "RST", "-j", "DROP")
+	cleaner.Push(func() {
+		clean1.Run()
+	})
+	defer func() {
+		if err != nil {
+			cleaner.Exit()
+		} else {
+			listener.cleaner = cleaner
+		}
+	}()
+	cmd2 := exec.Command("iptables", "-I", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
+		"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	_, err = cmd2.CombinedOutput()
+	if err != nil {
+		return
+	}
+	clean2 := exec.Command("iptables", "-D", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
+		"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	cleaner.Push(func() {
+		clean2.Run()
+	})
 	go listener.ackSender()
 	return
 }
