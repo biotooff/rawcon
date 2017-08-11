@@ -25,6 +25,7 @@ type RAWConn struct {
 	cleaner *utils.ExitCleaner
 	r       *Raw
 	hseqn   uint32
+	mss     int
 }
 
 func (raw *RAWConn) Close() (err error) {
@@ -44,6 +45,20 @@ func (raw *RAWConn) Close() (err error) {
 		}
 	}
 	return
+}
+
+func (raw *RAWConn) GetMSS() int {
+	return raw.mss
+}
+
+func getMssFromTcpLayer(tcp *tcpLayer) int {
+	for _, v := range tcp.options {
+		if v.kind != tcpOptionKindMSS || len(v.data) == 0 {
+			continue
+		}
+		return (int)(binary.BigEndian.Uint16(v.data))
+	}
+	return 0
 }
 
 func (layer *pktLayers) updateTCP() {
@@ -409,6 +424,7 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 			layer.tcp.seqn++
 			ackn = layer.tcp.ackn
 			seqn = layer.tcp.seqn
+			raw.mss = getMssFromTcpLayer(tcp)
 			err = raw.sendAck()
 			if err != nil {
 				return
@@ -480,6 +496,16 @@ type RAWListener struct {
 	conns   map[string]*connInfo
 	mutex   myMutex
 	laddr   *net.UDPAddr
+}
+
+func (listener *RAWListener) GetMSSByAddr(addr net.Addr) int {
+	listener.mutex.Lock()
+	defer listener.mutex.Unlock()
+	conn, ok := listener.conns[addr.String()]
+	if ok && conn.mss > 0 {
+		return conn.mss
+	}
+	return 0
 }
 
 func (listener *RAWListener) ackSender() {
@@ -712,6 +738,7 @@ func (listener *RAWListener) doRead(b []byte) (n int, addr *net.UDPAddr, err err
 			info = &connInfo{
 				state: synreceived,
 				layer: layer,
+				mss:   getMssFromTcpLayer(tcp),
 			}
 			binary.Read(rand.Reader, binary.LittleEndian, &(info.layer.tcp.seqn))
 			err = listener.sendSynAckWithLayer(info.layer)
@@ -762,6 +789,7 @@ type connInfo struct {
 	layer *pktLayers
 	rep   []byte
 	hseqn uint32
+	mss   int
 }
 
 // copy from github.com/google/gopacket/layers/tcp.go

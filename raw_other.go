@@ -30,6 +30,21 @@ type RAWConn struct {
 	r       *Raw
 	hseqn   uint32
 	lock    sync.Mutex
+	mss     int
+}
+
+func (raw *RAWConn) GetMSS() int {
+	return raw.mss
+}
+
+func getMssFromTcpLayer(tcp *layers.TCP) int {
+	for _, v := range tcp.Options {
+		if v.OptionType != layers.TCPOptionKindMSS || len(v.OptionData) == 0 {
+			continue
+		}
+		return (int)(binary.BigEndian.Uint16(v.OptionData))
+	}
+	return 0
 }
 
 func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
@@ -475,6 +490,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 			tcp.Seq++
 			ackn = tcp.Ack
 			seqn = tcp.Seq
+			conn.mss = getMssFromTcpLayer(cl.tcp)
 			err = conn.sendAck()
 			if err != nil {
 				return
@@ -563,6 +579,16 @@ type RAWListener struct {
 	mutex   myMutex
 	laddr   *net.IPAddr
 	lport   int
+}
+
+func (listener *RAWListener) GetMSSByAddr(addr net.Addr) int {
+	listener.mutex.Lock()
+	defer listener.mutex.Unlock()
+	conn, ok := listener.conns[addr.String()]
+	if ok && conn.mss > 0 {
+		return conn.mss
+	}
+	return 0
 }
 
 func (listener *RAWListener) Close() (err error) {
@@ -798,6 +824,7 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 			info := &connInfo{
 				state: synreceived,
 				layer: layer,
+				mss:   getMssFromTcpLayer(tcp),
 			}
 			binary.Read(rand.Reader, binary.LittleEndian, &(info.layer.tcp.Seq))
 			listener.layer = info.layer
@@ -846,4 +873,5 @@ type connInfo struct {
 	layer *pktLayers
 	rep   []byte
 	hseqn uint32
+	mss   int
 }
