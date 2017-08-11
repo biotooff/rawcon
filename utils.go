@@ -14,6 +14,7 @@ type Raw struct {
 	Host   string
 	DSCP   int
 	IgnRST bool
+	Hosts  []string
 }
 
 type callback func()

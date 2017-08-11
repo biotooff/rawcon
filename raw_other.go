@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	ran "math/rand"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -503,9 +506,15 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 	}
 	retry = 0
 	var headers string
-	if len(r.Host) != 0 {
-		headers += "Host: " + r.Host + "\r\n"
-		headers += "X-Online-Host: " + r.Host + "\r\n"
+	if len(r.Hosts) == 0 {
+		if len(r.Host) != 0 {
+			r.Hosts = strings.Split(r.Host, ",")
+		}
+	}
+	if len(r.Hosts) > 0 {
+		host := r.Hosts[ran.Int()%len(r.Hosts)]
+		headers += "Host: " + host + "\r\n"
+		headers += "X-Online-Host: " + host + "\r\n"
 	}
 	req := buildHTTPRequest(headers)
 	for {

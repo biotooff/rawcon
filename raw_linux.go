@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/ccsexyz/utils"
 
 	"os/exec"
 	"strconv"
+
+	ran "math/rand"
 
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
@@ -437,9 +440,15 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 	}
 	retry = 0
 	var headers string
-	if len(r.Host) != 0 {
-		headers += "Host: " + r.Host + "\r\n"
-		headers += "X-Online-Host: " + r.Host + "\r\n"
+	if len(r.Hosts) == 0 {
+		if len(r.Host) != 0 {
+			r.Hosts = strings.Split(r.Host, ",")
+		}
+	}
+	if len(r.Hosts) > 0 {
+		host := r.Hosts[ran.Int()%len(r.Hosts)]
+		headers += "Host: " + host + "\r\n"
+		headers += "X-Online-Host: " + host + "\r\n"
 	}
 	req := buildHTTPRequest(headers)
 	for {
