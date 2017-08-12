@@ -78,7 +78,7 @@ func (raw *RAWConn) updateTCP() {
 }
 
 func (raw *RAWConn) sendPacketWithLayer(layer *pktLayers) (err error) {
-	data := layer.tcp.marshalWithIPHeader(layer.ip4.srcip, layer.ip4.dstip, raw.r.DSCP)
+	data := layer.tcp.marshal(layer.ip4.srcip, layer.ip4.dstip)
 	if raw.udp != nil {
 		_, err = raw.conn.Write(data)
 	} else {
@@ -326,22 +326,24 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 	uremoteaddr := udp.RemoteAddr().(*net.UDPAddr)
 	conn, err := net.DialIP("ip4:tcp", &net.IPAddr{IP: ulocaladdr.IP}, &net.IPAddr{IP: uremoteaddr.IP})
 	fatalErr(err)
-	wconn, err := net.ListenIP("ip4:tcp", &net.IPAddr{IP: ulocaladdr.IP})
-	fatalErr(err)
 	if r.DSCP != 0 {
-		ipv4.NewConn(wconn).SetTOS(r.DSCP)
+		ipv4.NewConn(conn).SetTOS(r.DSCP)
 	}
-	rconn, err := ipv4.NewRawConn(conn)
-	fatalErr(err)
 	// https://www.kernel.org/doc/Documentation/networking/filter.txt
-	rconn.SetBPF([]bpf.RawInstruction{
+	ipv4.NewPacketConn(conn).SetBPF([]bpf.RawInstruction{
 		{0x30, 0, 0, 0x00000009},
-		{0x15, 0, 6, 0x00000006},
+		{0x15, 0, 12, 0x00000006},
 		{0x28, 0, 0, 0x00000006},
 		{0x45, 4, 0, 0x00001fff},
 		{0xb1, 0, 0, 0x00000000},
+		{0x48, 0, 0, 0x00000000},
+		{0x15, 4, 0, uint32(ulocaladdr.Port)},
+		{0x48, 0, 0, 0x00000000},
+		{0x15, 0, 5, uint32(uremoteaddr.Port)},
 		{0x48, 0, 0, 0x00000002},
-		{0x15, 0, 1, uint32(ulocaladdr.Port)},
+		{0x15, 2, 3, uint32(ulocaladdr.Port)},
+		{0x48, 0, 0, 0x00000002},
+		{0x15, 0, 1, uint32(uremoteaddr.Port)},
 		{0x6, 0, 0, 0x00040000},
 		{0x6, 0, 0, 0x00000000},
 	})
@@ -554,16 +556,15 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	if err != nil {
 		return
 	}
-	rconn, err := ipv4.NewRawConn(conn)
-	fatalErr(err)
-	// filter: tcp and src port udpaddr.Port
-	rconn.SetBPF([]bpf.RawInstruction{
+	ipv4.NewPacketConn(conn).SetBPF([]bpf.RawInstruction{
 		{0x30, 0, 0, 0x00000009},
-		{0x15, 0, 6, 0x00000006},
+		{0x15, 0, 8, 0x00000006},
 		{0x28, 0, 0, 0x00000006},
 		{0x45, 4, 0, 0x00001fff},
 		{0xb1, 0, 0, 0x00000000},
 		{0x48, 0, 0, 0x00000002},
+		{0x15, 2, 3, uint32(udpaddr.Port)},
+		{0x48, 0, 0, 0x00000000},
 		{0x15, 0, 1, uint32(udpaddr.Port)},
 		{0x6, 0, 0, 0x00040000},
 		{0x6, 0, 0, 0x00000000},
@@ -941,30 +942,6 @@ func decodeTCPlayer(data []byte) (tcp *tcpLayer, err error) {
 	}
 
 	return
-}
-
-func (tcp *tcpLayer) marshalWithIPHeader(srcip, dstip net.IP, tos int) (data []byte) {
-	d := tcp.data
-	defer func() { tcp.data = d }()
-	tcp.data = tcp.data[20:]
-	data = tcp.marshal(srcip, dstip)
-	header := ipv4.Header{
-		Version:  4,
-		Len:      20,
-		TOS:      tos,
-		TotalLen: len(data) + 20,
-		Flags:    ipv4.HeaderFlags(ipv4.DontFragment),
-		FragOff:  0,
-		TTL:      64,
-		Protocol: 6,
-		Dst:      dstip,
-	}
-	h, _ := header.Marshal()
-	if len(data) > len(tcp.data) {
-		return append(h, data...)
-	}
-	copy(d, h)
-	return d[:header.TotalLen]
 }
 
 func (tcp *tcpLayer) marshal(srcip, dstip net.IP) (data []byte) {
