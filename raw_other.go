@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 
 	ran "math/rand"
 
+	"github.com/ccsexyz/utils"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
@@ -26,6 +29,7 @@ type RAWConn struct {
 	pktsrc  *gopacket.PacketSource
 	opts    gopacket.SerializeOptions
 	buffer  gopacket.SerializeBuffer
+	cleaner *utils.ExitCleaner
 	packets chan gopacket.Packet
 	rtimer  *time.Timer
 	wtimer  *time.Timer
@@ -98,6 +102,9 @@ func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 }
 
 func (conn *RAWConn) close() (err error) {
+	if conn.cleaner != nil {
+		conn.cleaner.Exit()
+	}
 	if conn.udp != nil && conn.handle != nil {
 		conn.sendFin()
 	}
@@ -464,6 +471,27 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 			conn.Close()
 		}
 	}()
+	if runtime.GOOS == "darwin" {
+		cmd := exec.Command("sh", "-c", fmt.Sprintf("echo block drop out proto tcp from %s port %d to %s port %d flags R/R >> /etc/pf.conf && pfctl -f /etc/pf.conf",
+			localaddr.String(), ulocaladdr.Port, remoteaddr.String(), uremoteaddr.Port))
+		_, err = cmd.CombinedOutput()
+		if err == nil {
+			exec.Command("pfctl", "-e").Run()
+			cleaner := &utils.ExitCleaner{}
+			filename := randStringBytesMaskImprSrc(20)
+			clean := exec.Command("sh", "-c", fmt.Sprintf("cat /etc/pf.conf | grep -v "+
+				"'block drop out proto tcp from %s port %d to %s port %d flags R/R' > /tmp/%s.conf && mv /tmp/%s.conf /etc/pf.conf"+
+				" && pfctl -f /etc/pf.conf",
+				localaddr.String(), ulocaladdr.Port, remoteaddr.String(), uremoteaddr.Port, filename, filename))
+			cleaner.Push(func() {
+				clean.Run()
+				exec.Command("pfctl", "-e").Run()
+			})
+			conn.cleaner = cleaner
+		}
+	} else if runtime.GOOS == "windows" {
+
+	}
 	retry := 0
 	var ackn uint32
 	var seqn uint32
