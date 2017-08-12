@@ -10,6 +10,7 @@ import (
 )
 
 type Raw struct {
+	Mixed  bool
 	NoHTTP bool
 	Host   string
 	DSCP   int

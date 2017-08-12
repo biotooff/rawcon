@@ -721,6 +721,15 @@ func (listener *RAWListener) doRead(b []byte) (n int, addr *net.UDPAddr, err err
 							listener.conns[addrstr] = info
 							delete(listener.newcons, addrstr)
 						})
+					} else if listener.r.Mixed {
+						t.ackn = tcp.seqn + uint32(n)
+						info.state = established
+						listener.mutex.run(func() {
+							listener.conns[addrstr] = info
+							delete(listener.newcons, addrstr)
+						})
+						n = copy(b, tcp.payload)
+						return
 					}
 				} else if tcp.chkFlag(SYN) && !tcp.chkFlag(ACK|PSH) {
 					err = listener.sendSynAckWithLayer(info.layer)

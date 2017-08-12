@@ -792,6 +792,15 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 							listener.conns[addrstr] = info
 							delete(listener.newcons, addrstr)
 						})
+					} else if listener.r.Mixed {
+						info.layer.tcp.Ack = tcp.Seq + uint32(n)
+						info.state = established
+						listener.mutex.run(func() {
+							listener.conns[addrstr] = info
+							delete(listener.newcons, addrstr)
+						})
+						n = copy(b, tcp.Payload)
+						return
 					}
 				} else if tcp.SYN && !tcp.ACK && !tcp.PSH {
 					listener.layer = info.layer
