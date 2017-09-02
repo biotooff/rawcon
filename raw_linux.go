@@ -27,6 +27,7 @@ type RAWConn struct {
 	buf     []byte
 	cleaner *utils.ExitCleaner
 	r       *Raw
+	dstport int
 	hseqn   uint32
 	mss     int
 }
@@ -218,6 +219,9 @@ func (raw *RAWConn) ReadTCPLayer() (tcp *tcpLayer, addr *net.UDPAddr, err error)
 		if err != nil {
 			return
 		}
+		if tcp.dstPort != raw.dstport {
+			continue
+		}
 		if tcp.chkFlag(RST) {
 			if raw.r.IgnRST {
 				continue
@@ -308,7 +312,7 @@ func (raw *RAWConn) ackSender() {
 	var err error
 	ackn := raw.layer.tcp.ackn
 	for err == nil {
-		timer := time.NewTimer(time.Millisecond * time.Duration(200+int(src.Int63()%200)))
+		timer := time.NewTimer(time.Millisecond * time.Duration(200+int(ran.Int63()%200)))
 		<-timer.C
 		if ackn != raw.layer.tcp.ackn {
 			ackn = raw.layer.tcp.ackn
@@ -348,9 +352,10 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 		{0x6, 0, 0, 0x00000000},
 	})
 	raw = &RAWConn{
-		conn: conn,
-		udp:  udp,
-		buf:  make([]byte, 2048),
+		conn:    conn,
+		udp:     udp,
+		buf:     make([]byte, 2048),
+		dstport: ulocaladdr.Port,
 		layer: &pktLayers{
 			ip4: &iPv4Layer{
 				srcip: ulocaladdr.IP,
@@ -410,7 +415,7 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 		if err != nil {
 			return
 		}
-		err = raw.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(500+int(src.Int63()%500))))
+		err = raw.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(500+int(ran.Int63()%500))))
 		if err != nil {
 			return
 		}
@@ -463,7 +468,7 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 		if err != nil {
 			return
 		}
-		err = raw.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(500+int(src.Int63()%500))))
+		err = raw.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(500+int(ran.Int63()%500))))
 		if err != nil {
 			return
 		}
@@ -523,7 +528,7 @@ func (listener *RAWListener) ackSender() {
 	var err error
 	ackns := make(map[string]uint32)
 	for err == nil {
-		timer := time.NewTimer(time.Millisecond * time.Duration(200+int(src.Int63()%200)))
+		timer := time.NewTimer(time.Millisecond * time.Duration(200+int(ran.Int63()%200)))
 		<-timer.C
 		var conns []*connInfo
 		listener.mutex.Lock()
@@ -571,11 +576,12 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	})
 	listener = &RAWListener{
 		RAWConn: RAWConn{
-			conn:  conn,
-			udp:   nil,
-			buf:   make([]byte, 2048),
-			layer: nil,
-			r:     r,
+			conn:    conn,
+			udp:     nil,
+			buf:     make([]byte, 2048),
+			layer:   nil,
+			dstport: udpaddr.Port,
+			r:       r,
 		},
 		newcons: make(map[string]*connInfo),
 		conns:   make(map[string]*connInfo),
