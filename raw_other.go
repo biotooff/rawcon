@@ -492,11 +492,11 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		},
 		r: r,
 	}
-	// defer func() {
-	// 	if err == nil && conn != nil {
-	// 		go conn.ackSender()
-	// 	}
-	// }()
+	defer func() {
+		if err == nil && conn != nil {
+			go conn.ackSender()
+		}
+	}()
 	tcp := conn.layer.tcp
 	var cl *pktLayers
 	binary.Read(rand.Reader, binary.LittleEndian, &(conn.layer.tcp.Seq))
