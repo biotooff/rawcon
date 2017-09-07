@@ -299,6 +299,7 @@ func (raw *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				raw.layer.tcp.ackn = tcp.seqn + uint32(n)
 			}
 			n = copy(b, tcp.payload)
+			raw.trySendAck(raw.layer)
 		}
 		return n, addr, err
 	}
@@ -308,17 +309,16 @@ func (raw *RAWConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	return raw.Write(b)
 }
 
-func (raw *RAWConn) ackSender() {
-	var err error
-	ackn := raw.layer.tcp.ackn
-	for err == nil {
-		timer := time.NewTimer(time.Millisecond * time.Duration(200+int(ran.Int63()%200)))
-		<-timer.C
-		if ackn != raw.layer.tcp.ackn {
-			ackn = raw.layer.tcp.ackn
-			err = raw.sendAck()
+func (raw *RAWConn) trySendAck(layer *pktLayers) {
+	now := time.Now()
+	if layer.tcp.ackn < layer.lastack+16384 {
+		if now.Sub(layer.lastacktime) < time.Millisecond*time.Duration(10) {
+			return
 		}
 	}
+	layer.lastack = layer.tcp.ackn
+	layer.lastacktime = now
+	raw.sendAckWithLayer(layer)
 }
 
 func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
@@ -376,7 +376,6 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 		if err != nil {
 			raw.Close()
 		} else {
-			go raw.ackSender()
 			raw.SetReadDeadline(time.Time{})
 		}
 	}()
@@ -524,31 +523,6 @@ func (listener *RAWListener) GetMSSByAddr(addr net.Addr) int {
 	return 0
 }
 
-func (listener *RAWListener) ackSender() {
-	var err error
-	ackns := make(map[string]uint32)
-	for err == nil {
-		timer := time.NewTimer(time.Millisecond * time.Duration(200+int(ran.Int63()%200)))
-		<-timer.C
-		var conns []*connInfo
-		listener.mutex.Lock()
-		for k, v := range listener.conns {
-			ackn, ok := ackns[k]
-			if !ok || ackn != v.layer.tcp.ackn {
-				ackns[k] = v.layer.tcp.ackn
-				conns = append(conns, v)
-			}
-		}
-		listener.mutex.Unlock()
-		for _, v := range conns {
-			err = listener.sendAckWithLayer(v.layer)
-			if err != nil {
-				break
-			}
-		}
-	}
-}
-
 func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	udpaddr, err := net.ResolveUDPAddr("udp4", address)
 	if err != nil {
@@ -617,7 +591,6 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	cleaner.Push(func() {
 		clean2.Run()
 	})
-	go listener.ackSender()
 	return
 }
 
@@ -674,6 +647,7 @@ func (listener *RAWListener) doRead(b []byte) (n int, addr *net.UDPAddr, err err
 			}
 			if info.state == established {
 				n = copy(b, tcp.payload)
+				listener.trySendAck(info.layer)
 				return
 			}
 			continue
@@ -735,6 +709,7 @@ func (listener *RAWListener) doRead(b []byte) (n int, addr *net.UDPAddr, err err
 							delete(listener.newcons, addrstr)
 						})
 						n = copy(b, tcp.payload)
+						listener.trySendAck(info.layer)
 						return
 					}
 				} else if tcp.chkFlag(SYN) && !tcp.chkFlag(ACK|PSH) {
@@ -805,8 +780,10 @@ func (listener *RAWListener) WriteTo(b []byte, addr net.Addr) (n int, err error)
 }
 
 type pktLayers struct {
-	ip4 *iPv4Layer
-	tcp *tcpLayer
+	ip4         *iPv4Layer
+	tcp         *tcpLayer
+	lastack     uint32
+	lastacktime time.Time
 }
 
 type connInfo struct {

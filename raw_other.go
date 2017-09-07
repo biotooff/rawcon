@@ -271,6 +271,18 @@ func (conn *RAWConn) Write(b []byte) (n int, err error) {
 	return
 }
 
+func (conn *RAWConn) trySendAck(layer *pktLayers) {
+	now := time.Now()
+	if layer.tcp.Ack < layer.lastack+16384 {
+		if now.Sub(layer.lastacktime) < time.Millisecond*time.Duration(10) {
+			return
+		}
+	}
+	layer.lastack = layer.tcp.Ack
+	layer.lastacktime = now
+	conn.sendAckWithLayer(layer)
+}
+
 func (conn *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 	defer func() {
 		if conn.rtimer != nil {
@@ -310,6 +322,7 @@ func (conn *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				conn.layer.tcp.Ack = tcp.Seq + uint32(n)
 			}
 			n = copy(b, tcp.Payload)
+			conn.trySendAck(conn.layer)
 		}
 		return
 	}
@@ -363,25 +376,6 @@ func (conn *RAWConn) SetDeadline(t time.Time) (err error) {
 		err = conn.SetWriteDeadline(t)
 	}
 	return
-}
-
-func (conn *RAWConn) ackSender() {
-	var err error
-	ackn := conn.layer.tcp.Ack
-	for err == nil {
-		timer := time.NewTimer(time.Millisecond * time.Duration(50+int(ran.Int63()%50)))
-		select {
-		case <-timer.C:
-			// log.Println(conn.rack)
-			// log.Println(ackn, conn.layer.tcp.Ack)
-			if ackn != conn.layer.tcp.Ack {
-				ackn = conn.layer.tcp.Ack
-				conn.lock.Lock()
-				err = conn.sendAck()
-				conn.lock.Unlock()
-			}
-		}
-	}
 }
 
 func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
@@ -492,11 +486,6 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		},
 		r: r,
 	}
-	defer func() {
-		if err == nil && conn != nil {
-			go conn.ackSender()
-		}
-	}()
 	tcp := conn.layer.tcp
 	var cl *pktLayers
 	binary.Read(rand.Reader, binary.LittleEndian, &(conn.layer.tcp.Seq))
@@ -958,9 +947,11 @@ func (listener *RAWListener) LocalAddr() net.Addr {
 
 // FIXME
 type pktLayers struct {
-	eth *layers.Ethernet
-	ip4 *layers.IPv4
-	tcp *layers.TCP
+	eth         *layers.Ethernet
+	ip4         *layers.IPv4
+	tcp         *layers.TCP
+	lastack     uint32
+	lastacktime time.Time
 }
 
 type connInfo struct {
