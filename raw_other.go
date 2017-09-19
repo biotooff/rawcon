@@ -21,10 +21,12 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+	"golang.org/x/net/ipv4"
 )
 
 type RAWConn struct {
 	udp     net.Conn
+	tcp     net.Conn
 	handle  *pcap.Handle
 	pktsrc  *gopacket.PacketSource
 	opts    gopacket.SerializeOptions
@@ -113,6 +115,9 @@ func (conn *RAWConn) close() (err error) {
 	}
 	if conn.udp != nil {
 		err = conn.udp.Close()
+	}
+	if conn.tcp != nil {
+		err = conn.tcp.Close()
 	}
 	if conn.handle != nil {
 		conn.handle.Close()
@@ -378,7 +383,221 @@ func (conn *RAWConn) SetDeadline(t time.Time) (err error) {
 	return
 }
 
+func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
+	ifaces, err := pcap.FindAllDevs()
+	if err != nil {
+		return
+	}
+	udp, err := net.Dial("udp4", address)
+	if err != nil {
+		return
+	}
+	defer udp.Close()
+	var ifaceName string
+	for _, iface := range ifaces {
+		for _, addr := range iface.Addresses {
+			if addr.IP.Equal(udp.LocalAddr().(*net.UDPAddr).IP) {
+				ifaceName = iface.Name
+			}
+		}
+	}
+	if len(ifaceName) == 0 {
+		err = errors.New("cannot find correct interface")
+		return
+	}
+	handle, err := pcap.OpenLive(ifaceName, 65536, true, time.Millisecond)
+	if err != nil {
+		return
+	}
+	pktsrc := gopacket.NewPacketSource(handle, handle.LinkType())
+	packets := pktsrc.Packets()
+	filter := "tcp and src host " + udp.RemoteAddr().(*net.UDPAddr).IP.String() +
+		" and src port " + strconv.Itoa(udp.RemoteAddr().(*net.UDPAddr).Port)
+	err = handle.SetBPFFilter(filter)
+	if err != nil {
+		return
+	}
+	conn = &RAWConn{
+		buffer:  gopacket.NewSerializeBuffer(),
+		handle:  handle,
+		pktsrc:  pktsrc,
+		packets: packets,
+		opts: gopacket.SerializeOptions{
+			FixLengths:       true,
+			ComputeChecksums: true,
+		},
+		r: r,
+		layer: &pktLayers{
+			ip4: &layers.IPv4{
+				DstIP: udp.LocalAddr().(*net.UDPAddr).IP,
+			},
+			tcp: &layers.TCP{
+				DstPort: layers.TCPPort(udp.LocalAddr().(*net.UDPAddr).Port),
+			},
+		},
+	}
+	var layersArray []*pktLayers
+	var tcpConn net.Conn
+	var tcpConnErr error
+	var synAckLayer *pktLayers
+	var tcpLocalAddr *net.TCPAddr
+	var tcpRemoteAddr *net.TCPAddr
+	sigch := make(chan bool)
+	go func() {
+		<-sigch
+		tcpConn, tcpConnErr = net.Dial("tcp4", address)
+		if tcpConn != nil && tcpConnErr == nil {
+			tcpLocalAddr = tcpConn.LocalAddr().(*net.TCPAddr)
+			tcpRemoteAddr = tcpConn.RemoteAddr().(*net.TCPAddr)
+		}
+	}()
+	retry := 0
+	sigch <- true
+	for {
+		if tcpConnErr != nil {
+			err = tcpConnErr
+			return
+		}
+		if tcpConn != nil && tcpLocalAddr != nil && tcpRemoteAddr != nil {
+			for _, layer := range layersArray {
+				if int(layer.tcp.SrcPort) == tcpRemoteAddr.Port &&
+					int(layer.tcp.DstPort) == tcpLocalAddr.Port &&
+					layer.ip4.SrcIP.Equal(tcpRemoteAddr.IP) &&
+					layer.ip4.DstIP.Equal(tcpLocalAddr.IP) {
+					synAckLayer = layer
+					break
+				}
+			}
+			if synAckLayer != nil {
+				break
+			}
+			if retry > 5 {
+				err = fmt.Errorf("retry too many times and con't capture anything")
+				return
+			}
+		}
+		conn.SetReadDeadline(time.Now().Add(time.Millisecond * 500))
+		var layer *pktLayers
+		layer, err = conn.readLayers()
+		if err != nil {
+			if e, ok := err.(net.Error); ok && e.Temporary() {
+				retry++
+				continue
+			}
+			return
+		}
+		if layer == nil || layer.ip4 == nil || layer.tcp == nil ||
+			!(layer.tcp.SYN && layer.tcp.ACK) {
+			continue
+		}
+		layersArray = append(layersArray, layer)
+	}
+	conn.SetReadDeadline(time.Time{})
+	ipv4.NewConn(tcpConn).SetTTL(0)
+	conn.layer = &pktLayers{
+		ip4: &layers.IPv4{
+			SrcIP:    tcpLocalAddr.IP,
+			DstIP:    tcpRemoteAddr.IP,
+			Protocol: layers.IPProtocolTCP,
+			Version:  0x4,
+			Id:       uint16(ran.Int() % 65536),
+			Flags:    layers.IPv4DontFragment,
+			TTL:      0x40,
+			TOS:      uint8(r.DSCP),
+		},
+		tcp: &layers.TCP{
+			SrcPort: layers.TCPPort(tcpLocalAddr.Port),
+			DstPort: layers.TCPPort(tcpRemoteAddr.Port),
+			Window:  12580,
+			Ack:     synAckLayer.tcp.Seq + 1,
+			Seq:     synAckLayer.tcp.Ack,
+		},
+	}
+	if synAckLayer.eth != nil {
+		conn.layer.eth = &layers.Ethernet{
+			EthernetType: synAckLayer.eth.EthernetType,
+			SrcMAC:       synAckLayer.eth.DstMAC,
+			DstMAC:       synAckLayer.eth.SrcMAC,
+		}
+	}
+	conn.tcp = tcpConn
+	defer func() {
+		if err != nil {
+			conn.Close()
+		}
+	}()
+	filter = "tcp and src host " + conn.layer.ip4.DstIP.String() +
+		" and src port " + strconv.Itoa(int(conn.layer.tcp.DstPort)) +
+		" and dst host " + conn.layer.ip4.SrcIP.String() +
+		" and dst port " + strconv.Itoa(int(conn.layer.tcp.SrcPort))
+	err = handle.SetBPFFilter(filter)
+	if err != nil {
+		return
+	}
+	var cl *pktLayers
+	tcp := conn.layer.tcp
+	defer func() { conn.rtimer = nil }()
+	if r.NoHTTP {
+		return
+	}
+	retry = 0
+	var headers string
+	if len(r.Hosts) == 0 {
+		if len(r.Host) != 0 {
+			r.Hosts = strings.Split(r.Host, ",")
+		}
+	}
+	if len(r.Hosts) > 0 {
+		host := r.Hosts[ran.Int()%len(r.Hosts)]
+		headers += "Host: " + host + "\r\n"
+		headers += "X-Online-Host: " + host + "\r\n"
+	}
+	req := buildHTTPRequest(headers)
+out:
+	for {
+		if retry > 5 {
+			err = errors.New("retry too many times")
+			return
+		}
+		_, err = conn.write([]byte(req))
+		if err != nil {
+			return
+		}
+		err = conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(500+int(ran.Int63()%500))))
+		if err != nil {
+			return
+		}
+		for {
+			cl, err = conn.readLayers()
+			if err != nil {
+				e, ok := err.(net.Error)
+				if !ok || !e.Temporary() {
+					return
+				} else {
+					retry++
+					continue out
+				}
+			}
+			n := len(cl.tcp.Payload)
+			if cl.tcp.PSH && cl.tcp.ACK && n >= 20 {
+				head := string(cl.tcp.Payload[:4])
+				tail := string(cl.tcp.Payload[n-4:])
+				if head == "HTTP" && tail == "\r\n\r\n" {
+					conn.hseqn = cl.tcp.Seq
+					tcp.Seq += uint32(len(req))
+					tcp.Ack = cl.tcp.Seq + uint32(n)
+					break out
+				}
+			}
+		}
+	}
+	return
+}
+
 func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
+	if r.Dummy {
+		return r.dialRAWDummy(address)
+	}
 	ifaces, err := pcap.FindAllDevs()
 	if err != nil {
 		return
