@@ -472,7 +472,14 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 				break
 			}
 			if retry > 5 {
-				err = fmt.Errorf("retry too many times and con't capture anything")
+				var layersArrayString string
+				for _, layer := range layersArray {
+					layersArrayString += fmt.Sprintf("{%d %d %v %v} ", int(layer.tcp.SrcPort), int(layer.tcp.DstPort),
+						layer.ip4.SrcIP.Equal(tcpRemoteAddr.IP), layer.ip4.DstIP.Equal(tcpLocalAddr.IP))
+				}
+				err = fmt.Errorf("retry too many times and con't capture anything\n"+
+					"len(layersArray)=%d\n"+"tcpRemoteAddr.Port=%d\ntcpLocalAddr.Port=%d\n"+
+					"layersArray:\n%s\n", len(layersArray), tcpRemoteAddr.Port, tcpLocalAddr.Port, layersArrayString)
 				return
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"sync"
 )
 
@@ -15,7 +16,7 @@ type Raw struct {
 	DSCP   int
 	IgnRST bool
 	Hosts  []string
-	Dummy bool
+	Dummy  bool
 }
 
 type callback func()
@@ -130,4 +131,17 @@ const (
 	waithttpreq = 1
 	httprepsent = 2
 	established = 3
+)
+
+func getSrcIPForDstIP(dstip net.IP) (srcip net.IP, err error) {
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: dstip, Port: 80})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP, nil
+}
+
+var (
+	ipv4AddrAny = net.IPv4(0, 0, 0, 0)
 )

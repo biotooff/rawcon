@@ -528,13 +528,14 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	if err != nil {
 		return
 	}
-	if udpaddr.IP == nil || udpaddr.IP.Equal(net.IPv4(0, 0, 0, 0)) {
-		udpaddr.IP = net.IPv4(127, 0, 0, 1)
+	if udpaddr.IP == nil {
+		udpaddr.IP = ipv4AddrAny
 	}
 	conn, err := net.ListenIP("ip4:tcp", &net.IPAddr{IP: udpaddr.IP})
 	if err != nil {
 		return
 	}
+	isAddrAny := udpaddr.IP.Equal(ipv4AddrAny)
 	ipv4.NewPacketConn(conn).SetBPF([]bpf.RawInstruction{
 		{0x30, 0, 0, 0x00000009},
 		{0x15, 0, 8, 0x00000006},
@@ -561,15 +562,27 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 		conns:   make(map[string]*connInfo),
 		laddr:   udpaddr,
 	}
-	cmd := exec.Command("iptables", "-I", "OUTPUT", "-p", "tcp", "-s", conn.LocalAddr().String(),
-		"--sport", strconv.Itoa(udpaddr.Port), "--tcp-flags", "RST", "RST", "-j", "DROP")
+	var cmd *exec.Cmd
+	if isAddrAny {
+		cmd = exec.Command("iptables", "-I", "OUTPUT", "-p", "tcp",
+			"--sport", strconv.Itoa(udpaddr.Port), "--tcp-flags", "RST", "RST", "-j", "DROP")
+	} else {
+		cmd = exec.Command("iptables", "-I", "OUTPUT", "-p", "tcp", "-s", conn.LocalAddr().String(),
+			"--sport", strconv.Itoa(udpaddr.Port), "--tcp-flags", "RST", "RST", "-j", "DROP")
+	}
 	_, err = cmd.CombinedOutput()
 	if err != nil {
 		return
 	}
 	cleaner := &utils.ExitCleaner{}
-	clean1 := exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", "-s", conn.LocalAddr().String(),
-		"--sport", strconv.Itoa(udpaddr.Port), "--tcp-flags", "RST", "RST", "-j", "DROP")
+	var clean1 *exec.Cmd
+	if isAddrAny {
+		clean1 = exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp",
+			"--sport", strconv.Itoa(udpaddr.Port), "--tcp-flags", "RST", "RST", "-j", "DROP")
+	} else {
+		clean1 = exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", "-s", conn.LocalAddr().String(),
+			"--sport", strconv.Itoa(udpaddr.Port), "--tcp-flags", "RST", "RST", "-j", "DROP")
+	}
 	cleaner.Push(func() {
 		clean1.Run()
 	})
@@ -580,14 +593,27 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 			listener.cleaner = cleaner
 		}
 	}()
-	cmd2 := exec.Command("iptables", "-I", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
-		"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	var cmd2 *exec.Cmd
+	if isAddrAny {
+		cmd2 = exec.Command("iptables", "-I", "INPUT", "-p", "tcp",
+			"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	} else {
+		cmd2 = exec.Command("iptables", "-I", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
+			"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	}
+
 	_, err = cmd2.CombinedOutput()
 	if err != nil {
 		return
 	}
-	clean2 := exec.Command("iptables", "-D", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
-		"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	var clean2 *exec.Cmd
+	if isAddrAny {
+		clean2 = exec.Command("iptables", "-D", "INPUT", "-p", "tcp",
+			"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	} else {
+		clean2 = exec.Command("iptables", "-D", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
+			"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	}
 	cleaner.Push(func() {
 		clean2.Run()
 	})
@@ -721,9 +747,16 @@ func (listener *RAWListener) doRead(b []byte) (n int, addr *net.UDPAddr, err err
 			}
 			continue
 		}
+		srcip := listener.laddr.IP
+		if srcip.Equal(ipv4AddrAny) {
+			srcip, _ = getSrcIPForDstIP(addr.IP)
+			if srcip == nil {
+				continue
+			}
+		}
 		layer := &pktLayers{
 			ip4: &iPv4Layer{
-				srcip: listener.laddr.IP,
+				srcip: srcip,
 				dstip: addr.IP,
 			},
 			tcp: &tcpLayer{
