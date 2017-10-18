@@ -457,17 +457,23 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 		headers += "X-Online-Host: " + host + "\r\n"
 	}
 	req := buildHTTPRequest(headers)
+	needretry := true
+	var starttime time.Time
 	for {
-		if retry > 5 {
+		if retry > 25 {
 			err = errors.New("retry too many times")
 			return
 		}
-		retry++
-		_, err = raw.write([]byte(req))
-		if err != nil {
-			return
+		if needretry {
+			needretry = false
+			starttime = time.Now()
+			retry++
+			_, err = raw.write([]byte(req))
+			if err != nil {
+				return
+			}
 		}
-		err = raw.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(500+int(ran.Int63()%500))))
+		err = raw.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(200+int(ran.Int63()%100))))
 		if err != nil {
 			return
 		}
@@ -478,6 +484,7 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 			if !ok || !e.Temporary() {
 				return
 			} else {
+				needretry = true
 				continue
 			}
 		}
@@ -500,6 +507,9 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 				raw.hseqn = tcp.seqn
 				break
 			}
+		}
+		if time.Now().After(starttime.Add(time.Millisecond * 200)) {
+			needretry = true
 		}
 	}
 	return

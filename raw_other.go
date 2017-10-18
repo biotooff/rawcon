@@ -560,42 +560,49 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		headers += "X-Online-Host: " + host + "\r\n"
 	}
 	req := buildHTTPRequest(headers)
+	needretry := true
+	var starttime time.Time
 out:
 	for {
-		if retry > 5 {
+		if retry > 25 {
 			err = errors.New("retry too many times")
 			return
 		}
-		_, err = conn.write([]byte(req))
-		if err != nil {
-			return
-		}
-		err = conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(500+int(ran.Int63()%500))))
-		if err != nil {
-			return
-		}
-		for {
-			cl, err = conn.readLayers()
+		if needretry {
+			starttime = time.Now()
+			needretry = false
+			retry++
+			_, err = conn.write([]byte(req))
 			if err != nil {
-				e, ok := err.(net.Error)
-				if !ok || !e.Temporary() {
-					return
-				} else {
-					retry++
-					continue out
-				}
+				return
 			}
-			n := len(cl.tcp.Payload)
-			if cl.tcp.PSH && cl.tcp.ACK && n >= 20 {
-				head := string(cl.tcp.Payload[:4])
-				tail := string(cl.tcp.Payload[n-4:])
-				if head == "HTTP" && tail == "\r\n\r\n" {
-					conn.hseqn = cl.tcp.Seq
-					tcp.Seq += uint32(len(req))
-					tcp.Ack = cl.tcp.Seq + uint32(n)
-					break out
-				}
+		}
+		err = conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(200+int(ran.Int63()%100))))
+		if err != nil {
+			return
+		}
+		cl, err = conn.readLayers()
+		if err != nil {
+			e, ok := err.(net.Error)
+			if !ok || !e.Temporary() {
+				return
 			}
+			needretry = true
+			continue out
+		}
+		n := len(cl.tcp.Payload)
+		if cl.tcp.PSH && cl.tcp.ACK && n >= 20 {
+			head := string(cl.tcp.Payload[:4])
+			tail := string(cl.tcp.Payload[n-4:])
+			if head == "HTTP" && tail == "\r\n\r\n" {
+				conn.hseqn = cl.tcp.Seq
+				tcp.Seq += uint32(len(req))
+				tcp.Ack = cl.tcp.Seq + uint32(n)
+				break out
+			}
+		}
+		if time.Now().After(starttime.Add(time.Millisecond * 200)) {
+			needretry = true
 		}
 	}
 	return
@@ -794,17 +801,23 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		headers += "X-Online-Host: " + host + "\r\n"
 	}
 	req := buildHTTPRequest(headers)
+	needretry := true
+	var starttime time.Time
 	for {
-		if retry > 5 {
+		if retry > 25 {
 			err = errors.New("retry too many times")
 			return
 		}
-		retry++
-		_, err = conn.write([]byte(req))
-		if err != nil {
-			return
+		if needretry {
+			needretry = false
+			starttime = time.Now()
+			retry++
+			_, err = conn.write([]byte(req))
+			if err != nil {
+				return
+			}
 		}
-		err = conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(500+int(ran.Int63()%500))))
+		err = conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(200+int(ran.Int63()%100))))
 		if err != nil {
 			return
 		}
@@ -813,9 +826,9 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 			e, ok := err.(net.Error)
 			if !ok || !e.Temporary() {
 				return
-			} else {
-				continue
 			}
+			needretry = true
+			continue
 		}
 		if cl.tcp.SYN && cl.tcp.ACK {
 			tcp.Ack = ackn
@@ -836,6 +849,9 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 				tcp.Ack = cl.tcp.Seq + uint32(n)
 				break
 			}
+		}
+		if time.Now().After(starttime.Add(time.Millisecond * 200)) {
+			needretry = true
 		}
 	}
 	return
