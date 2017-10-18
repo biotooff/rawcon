@@ -17,10 +17,10 @@ import (
 
 	ran "math/rand"
 
+	"github.com/ccsexyz/gopacket/layers"
+	"github.com/ccsexyz/gopacket/pcap"
 	"github.com/ccsexyz/utils"
 	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
 	"golang.org/x/net/ipv4"
 )
 
