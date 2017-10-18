@@ -25,21 +25,29 @@ import (
 )
 
 type RAWConn struct {
-	udp     net.Conn
-	tcp     net.Conn
-	handle  *pcap.Handle
-	pktsrc  *gopacket.PacketSource
-	opts    gopacket.SerializeOptions
-	buffer  gopacket.SerializeBuffer
-	cleaner *utils.ExitCleaner
-	packets chan gopacket.Packet
-	rtimer  *time.Timer
-	wtimer  *time.Timer
-	layer   *pktLayers
-	r       *Raw
-	hseqn   uint32
-	lock    sync.Mutex
-	mss     int
+	udp        net.Conn
+	tcp        net.Conn
+	handle     *pcap.Handle
+	pktsrc     *gopacket.PacketSource
+	opts       gopacket.SerializeOptions
+	buffer     gopacket.SerializeBuffer
+	cleaner    *utils.ExitCleaner
+	packets    chan gopacket.Packet
+	rtimer     *time.Timer
+	wtimer     *time.Timer
+	layer      *pktLayers
+	r          *Raw
+	hseqn      uint32
+	lock       sync.Mutex
+	mss        int
+	async      utils.AsyncRunner
+	linktype   layers.LinkType
+	rcond      *sync.Cond
+	rver       uint64
+	errch      chan error
+	nocopy     bool
+	isLoopBack bool
+	die        chan struct{}
 }
 
 func (raw *RAWConn) GetMSS() int {
@@ -56,33 +64,96 @@ func getMssFromTcpLayer(tcp *layers.TCP) int {
 	return 0
 }
 
+func (conn *RAWConn) reader() {
+	rver := uint64(0)
+	for {
+		conn.rcond.L.Lock()
+		for {
+			select {
+			default:
+			case <-conn.die:
+				conn.rcond.L.Unlock()
+				return
+			}
+			if conn.rver > rver {
+				rver = conn.rver
+				break
+			}
+			conn.rcond.Wait()
+		}
+		conn.rcond.L.Unlock()
+		data, _, err := conn.handle.ZeroCopyReadPacketData()
+		if err != nil {
+			select {
+			case <-conn.die:
+			case conn.errch <- err:
+			}
+			return
+		}
+		packet := gopacket.NewPacket(data, conn.linktype, gopacket.DecodeOptions{NoCopy: conn.nocopy, Lazy: true})
+		// log.Println(packet)
+		select {
+		case <-conn.die:
+			return
+		case conn.packets <- packet:
+		}
+	}
+}
+
+func (conn *RAWConn) notifyReader() {
+	conn.rcond.L.Lock()
+	defer conn.rcond.L.Unlock()
+	conn.rver++
+	conn.rcond.Signal()
+}
+
+func (conn *RAWConn) readPacket() (packet gopacket.Packet, err error) {
+	select {
+	default:
+	case packet = <-conn.packets:
+		return
+	}
+
+	conn.notifyReader()
+
+	var timeoutch <-chan time.Time
+	if conn.rtimer != nil {
+		timeoutch = conn.rtimer.C
+	}
+
+	var ok bool
+	select {
+	case <-timeoutch:
+		err = &timeoutErr{
+			op: "read from " + conn.RemoteAddr().String(),
+		}
+	case err = <-conn.errch:
+	case packet, ok = <-conn.packets:
+		if packet == nil || ok == false {
+			err = fmt.Errorf("read from closed connection")
+		}
+	}
+	return
+}
+
 func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 	for {
 		var packet gopacket.Packet
-		var ok bool
-		if conn.rtimer != nil {
-			select {
-			case <-conn.rtimer.C:
-				err = &timeoutErr{
-					op: "read from " + conn.RemoteAddr().String(),
-				}
-				return
-			case packet, ok = <-conn.packets:
-			}
-		} else {
-			packet, ok = <-conn.packets
-		}
-		// log.Println(packet)
-		if packet == nil || !ok {
-			err = fmt.Errorf("read from closed connection")
+		packet, err = conn.readPacket()
+		if err != nil {
 			return
 		}
-		ethLayer := packet.Layer(layers.LayerTypeEthernet)
-		loopLayer := packet.Layer(layers.LayerTypeLoopback)
+		var eth *layers.Ethernet
+		var ethLayer, loopLayer gopacket.Layer
+		if conn.isLoopBack {
+			loopLayer = packet.Layer(layers.LayerTypeLoopback)
+		} else {
+			ethLayer = packet.Layer(layers.LayerTypeEthernet)
+			eth, _ = ethLayer.(*layers.Ethernet)
+		}
 		if ethLayer == nil && loopLayer == nil {
 			continue
 		}
-		eth, _ := ethLayer.(*layers.Ethernet)
 		ipLayer := packet.Layer(layers.LayerTypeIPv4)
 		if ipLayer == nil {
 			continue
@@ -103,9 +174,16 @@ func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 	}
 }
 
-func (conn *RAWConn) close() (err error) {
+func (conn *RAWConn) Close() (err error) {
 	conn.lock.Lock()
 	defer conn.lock.Unlock()
+	if conn.die != nil {
+		select {
+		default:
+		case <-conn.die:
+			return
+		}
+	}
 	if conn.cleaner != nil {
 		conn.cleaner.Exit()
 		conn.cleaner = nil
@@ -122,11 +200,15 @@ func (conn *RAWConn) close() (err error) {
 	if conn.handle != nil {
 		conn.handle.Close()
 	}
+	if conn.die != nil {
+		close(conn.die)
+	}
+	go func() {
+		conn.rcond.L.Lock()
+		defer conn.rcond.L.Unlock()
+		conn.rcond.Broadcast()
+	}()
 	return
-}
-
-func (conn *RAWConn) Close() (err error) {
-	return conn.close()
 }
 
 func (conn *RAWConn) sendPacketWithLayer(layer *pktLayers) (err error) {
@@ -409,8 +491,6 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 	if err != nil {
 		return
 	}
-	pktsrc := gopacket.NewPacketSource(handle, handle.LinkType())
-	packets := pktsrc.Packets()
 	filter := "tcp and src host " + udp.RemoteAddr().(*net.UDPAddr).IP.String() +
 		" and src port " + strconv.Itoa(udp.RemoteAddr().(*net.UDPAddr).Port)
 	err = handle.SetBPFFilter(filter)
@@ -418,10 +498,10 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		return
 	}
 	conn = &RAWConn{
-		buffer:  gopacket.NewSerializeBuffer(),
-		handle:  handle,
-		pktsrc:  pktsrc,
-		packets: packets,
+		buffer:     gopacket.NewSerializeBuffer(),
+		handle:     handle,
+		isLoopBack: udp.LocalAddr().(*net.UDPAddr).IP.IsLoopback(),
+		packets:    make(chan gopacket.Packet),
 		opts: gopacket.SerializeOptions{
 			FixLengths:       true,
 			ComputeChecksums: true,
@@ -435,7 +515,18 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 				DstPort: layers.TCPPort(udp.LocalAddr().(*net.UDPAddr).Port),
 			},
 		},
+		linktype: handle.LinkType(),
+		die:      make(chan struct{}),
+		rcond:    &sync.Cond{L: &sync.Mutex{}},
 	}
+	go conn.reader()
+	defer func() {
+		if err != nil {
+			conn.Close()
+		} else {
+			conn.nocopy = true
+		}
+	}()
 	var layersArray []*pktLayers
 	var tcpConn net.Conn
 	var tcpConnErr error
@@ -528,11 +619,6 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		}
 	}
 	conn.tcp = tcpConn
-	defer func() {
-		if err != nil {
-			conn.Close()
-		}
-	}()
 	filter = "tcp and src host " + conn.layer.ip4.DstIP.String() +
 		" and src port " + strconv.Itoa(int(conn.layer.tcp.DstPort)) +
 		" and dst host " + conn.layer.ip4.SrcIP.String() +
@@ -640,8 +726,47 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 	if err != nil {
 		return
 	}
-	pktsrc := gopacket.NewPacketSource(handle, handle.LinkType())
-	packets := pktsrc.Packets()
+	conn = &RAWConn{
+		udp:        udp,
+		buffer:     gopacket.NewSerializeBuffer(),
+		handle:     handle,
+		isLoopBack: udp.LocalAddr().(*net.UDPAddr).IP.IsLoopback(),
+		packets:    make(chan gopacket.Packet),
+		opts: gopacket.SerializeOptions{
+			FixLengths:       true,
+			ComputeChecksums: true,
+		},
+		layer: &pktLayers{
+			ip4: &layers.IPv4{
+				SrcIP:    localaddr.IP,
+				DstIP:    remoteaddr.IP,
+				Protocol: layers.IPProtocolTCP,
+				Version:  0x4,
+				Id:       uint16(ran.Int63() % 65536),
+				Flags:    layers.IPv4DontFragment,
+				TTL:      0x40,
+				TOS:      uint8(r.DSCP),
+			},
+			tcp: &layers.TCP{
+				SrcPort: layers.TCPPort(ulocaladdr.Port),
+				DstPort: layers.TCPPort(uremoteaddr.Port),
+				Window:  12580,
+				Ack:     0,
+			},
+		},
+		r:        r,
+		linktype: handle.LinkType(),
+		die:      make(chan struct{}),
+		rcond:    &sync.Cond{L: &sync.Mutex{}},
+	}
+	go conn.reader()
+	defer func() {
+		if err != nil {
+			conn.Close()
+		} else {
+			conn.nocopy = true
+		}
+	}()
 	var eth *layers.Ethernet
 	if ulocaladdr.IP.String() != "127.0.0.1" {
 		buf := make([]byte, 32)
@@ -660,26 +785,33 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 			return
 		}
 
-		_, err = uconn.Write(buf)
+		sigch := make(chan bool)
+
+		go func() {
+			<-sigch
+			_, err = uconn.Write(buf)
+			if err != nil {
+				return
+			}
+		}()
+
+		conn.SetReadDeadline(time.Now().Add(time.Second * 2))
+
+		var packet gopacket.Packet
+		packet, err = conn.readPacket()
 		if err != nil {
 			return
 		}
 
-		timer := time.NewTimer(time.Second * 2)
-		select {
-		case <-timer.C:
-			err = errors.New("timeout")
+		ethLayer := packet.Layer(layers.LayerTypeEthernet)
+		loopLayer := packet.Layer(layers.LayerTypeLoopback)
+		if ethLayer != nil {
+			eth, _ = ethLayer.(*layers.Ethernet)
+		} else if loopLayer == nil {
 			return
-		case packet := <-packets:
-			ethLayer := packet.Layer(layers.LayerTypeEthernet)
-			loopLayer := packet.Layer(layers.LayerTypeLoopback)
-			if ethLayer != nil {
-				eth, _ = ethLayer.(*layers.Ethernet)
-			} else if loopLayer == nil {
-				return
-			}
 		}
 	}
+	conn.layer.eth = eth
 	filter := "tcp and src host " + remoteaddr.String() +
 		" and src port " + strconv.Itoa(uremoteaddr.Port) +
 		" and dst host " + localaddr.String() +
@@ -688,45 +820,9 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 	if err != nil {
 		return
 	}
-	conn = &RAWConn{
-		udp:     udp,
-		buffer:  gopacket.NewSerializeBuffer(),
-		handle:  handle,
-		pktsrc:  pktsrc,
-		packets: packets,
-		opts: gopacket.SerializeOptions{
-			FixLengths:       true,
-			ComputeChecksums: true,
-		},
-		layer: &pktLayers{
-			eth: eth,
-			ip4: &layers.IPv4{
-				SrcIP:    localaddr.IP,
-				DstIP:    remoteaddr.IP,
-				Protocol: layers.IPProtocolTCP,
-				Version:  0x4,
-				Id:       uint16(ran.Int63() % 65536),
-				Flags:    layers.IPv4DontFragment,
-				TTL:      0x40,
-				TOS:      uint8(r.DSCP),
-			},
-			tcp: &layers.TCP{
-				SrcPort: layers.TCPPort(ulocaladdr.Port),
-				DstPort: layers.TCPPort(uremoteaddr.Port),
-				Window:  12580,
-				Ack:     0,
-			},
-		},
-		r: r,
-	}
 	tcp := conn.layer.tcp
 	var cl *pktLayers
 	binary.Read(rand.Reader, binary.LittleEndian, &(conn.layer.tcp.Seq))
-	defer func() {
-		if err != nil {
-			conn.Close()
-		}
-	}()
 	if runtime.GOOS == "darwin" {
 		cmd := exec.Command("sh", "-c", fmt.Sprintf("echo block drop out proto tcp from %s port %d to %s port %d flags R/R >> /etc/pf.conf && pfctl -f /etc/pf.conf",
 			localaddr.String(), ulocaladdr.Port, remoteaddr.String(), uremoteaddr.Port))
@@ -768,9 +864,8 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 			e, ok := err.(net.Error)
 			if !ok || !e.Temporary() {
 				return
-			} else {
-				continue
 			}
+			continue
 		}
 		if cl.tcp.SYN && cl.tcp.ACK {
 			tcp.Ack = cl.tcp.Seq + 1
@@ -905,7 +1000,7 @@ func (listener *RAWListener) Close() (err error) {
 	// 		}
 	// 	})
 	// }
-	return conn.close()
+	return conn.RAWConn.Close()
 }
 
 func (listener *RAWListener) closeConn(info *connInfo) (err error) {
