@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,8 +33,8 @@ type RAWConn struct {
 	buffer     gopacket.SerializeBuffer
 	cleaner    *utils.ExitCleaner
 	packets    chan gopacket.Packet
-	rtimer     *time.Timer
-	wtimer     *time.Timer
+	rtime      time.Time
+	wtime      time.Time
 	layer      *pktLayers
 	r          *Raw
 	hseqn      uint32
@@ -66,76 +68,25 @@ func getMssFromTcpLayer(tcp *layers.TCP) int {
 	return 0
 }
 
-func (conn *RAWConn) reader() {
-	rver := uint64(0)
+func (conn *RAWConn) readPacket() (packet gopacket.Packet, err error) {
 	for {
-		conn.rcond.L.Lock()
-		for {
-			select {
-			default:
-			case <-conn.die:
-				conn.rcond.L.Unlock()
+		var data []byte
+		data, _, err = conn.sniffer.ReadPacketData()
+		if err != nil {
+			if err != bsdbpf.ErrTimeout {
 				return
 			}
-			if conn.rver > rver {
-				rver = conn.rver
-				break
+			if conn.rtime.Equal(time.Time{}) || conn.rtime.After(time.Now()) {
+				continue
 			}
-			conn.rcond.Wait()
-		}
-		conn.rcond.L.Unlock()
-		data, _, err := conn.sniffer.ReadPacketData()
-		if err != nil {
-			select {
-			case <-conn.die:
-			case conn.errch <- err:
+			err = &timeoutErr{
+				op: "read from " + conn.RemoteAddr().String(),
 			}
 			return
 		}
-		packet := gopacket.NewPacket(data, conn.linktype, gopacket.DecodeOptions{NoCopy: conn.nocopy, Lazy: true})
-		// log.Println(packet)
-		select {
-		case <-conn.die:
-			return
-		case conn.packets <- packet:
-		}
-	}
-}
-
-func (conn *RAWConn) notifyReader() {
-	conn.rcond.L.Lock()
-	defer conn.rcond.L.Unlock()
-	conn.rver++
-	conn.rcond.Signal()
-}
-
-func (conn *RAWConn) readPacket() (packet gopacket.Packet, err error) {
-	select {
-	default:
-	case packet = <-conn.packets:
+		packet = gopacket.NewPacket(data, conn.linktype, gopacket.DecodeOptions{NoCopy: conn.nocopy, Lazy: true})
 		return
 	}
-
-	conn.notifyReader()
-
-	var timeoutch <-chan time.Time
-	if conn.rtimer != nil {
-		timeoutch = conn.rtimer.C
-	}
-
-	var ok bool
-	select {
-	case <-timeoutch:
-		err = &timeoutErr{
-			op: "read from " + conn.RemoteAddr().String(),
-		}
-	case err = <-conn.errch:
-	case packet, ok = <-conn.packets:
-		if packet == nil || ok == false {
-			err = fmt.Errorf("read from closed connection")
-		}
-	}
-	return
 }
 
 func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
@@ -385,12 +336,6 @@ func (conn *RAWConn) trySendAck(layer *pktLayers) {
 }
 
 func (conn *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
-	defer func() {
-		if conn.rtimer != nil {
-			conn.rtimer.Stop()
-			conn.rtimer = nil
-		}
-	}()
 	for {
 		var layer *pktLayers
 		layer, err = conn.readLayers()
@@ -456,18 +401,12 @@ func (conn *RAWConn) RemoteAddr() net.Addr {
 }
 
 func (conn *RAWConn) SetReadDeadline(t time.Time) (err error) {
-	if conn.rtimer != nil {
-		conn.rtimer.Stop()
-	}
-	conn.rtimer = time.NewTimer(t.Sub(time.Now()))
+	conn.rtime = t
 	return
 }
 
 func (conn *RAWConn) SetWriteDeadline(t time.Time) (err error) {
-	if conn.wtimer != nil {
-		conn.wtimer.Stop()
-	}
-	conn.wtimer = time.NewTimer(t.Sub(time.Now()))
+	conn.wtime = t
 	return
 }
 
@@ -517,7 +456,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 	sniffer, err := bsdbpf.NewBPFSniffer(iface.Name, &bsdbpf.Options{
 		BPFDeviceName:    "",
 		ReadBufLen:       65536,
-		Timeout:          nil,
+		Timeout:          &syscall.Timeval{Sec: 0, Usec: 1000}, // 0.001s
 		Promisc:          false,
 		Immediate:        true,
 		PreserveLinkAddr: true,
@@ -525,12 +464,6 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 	if err != nil {
 		return
 	}
-	// filter := "tcp and src host " + udp.RemoteAddr().(*net.UDPAddr).IP.String() +
-	// 	" and src port " + strconv.Itoa(udp.RemoteAddr().(*net.UDPAddr).Port)
-	// err = handle.SetBPFFilter(filter)
-	// if err != nil {
-	// 	return
-	// }
 	conn = &RAWConn{
 		sniffer:    sniffer,
 		buffer:     gopacket.NewSerializeBuffer(),
@@ -554,7 +487,6 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 	}
 	conn.sip = udp.RemoteAddr().(*net.UDPAddr).IP
 	conn.sport = udp.RemoteAddr().(*net.UDPAddr).Port
-	go conn.reader()
 	defer func() {
 		if err != nil {
 			conn.Close()
@@ -699,14 +631,6 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 	conn.tcp = tcpConn
 	conn.dip = conn.layer.ip4.SrcIP
 	conn.dport = int(conn.layer.tcp.SrcPort)
-	// filter = "tcp and src host " + conn.layer.ip4.DstIP.String() +
-	// 	" and src port " + strconv.Itoa(int(conn.layer.tcp.DstPort)) +
-	// 	" and dst host " + conn.layer.ip4.SrcIP.String() +
-	// 	" and dst port " + strconv.Itoa(int(conn.layer.tcp.SrcPort))
-	// err = handle.SetBPFFilter(filter)
-	// if err != nil {
-	// 	return
-	// }
 	if conn.isLoopBack {
 		err = conn.sniffer.SetBpf([]syscall.BpfInsn{
 			{0x20, 0, 0, 0x00000000},
@@ -758,7 +682,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 	}
 	var cl *pktLayers
 	tcp := conn.layer.tcp
-	defer func() { conn.rtimer = nil }()
+	defer func() { conn.SetDeadline(time.Time{}) }()
 	if r.NoHTTP {
 		return
 	}
@@ -824,16 +748,334 @@ out:
 }
 
 func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
-	return r.dialRAWDummy(address)
+	if r.Dummy {
+		return r.dialRAWDummy(address)
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return
+	}
+	udp, err := net.Dial("udp4", address)
+	if err != nil {
+		return
+	}
+	defer func() {
+		if udp != nil {
+			udp.Close()
+		}
+	}()
+	var iface net.Interface
+	for _, i := range ifaces {
+		addrs, err := i.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ipstr string
+			ip, _, err := net.ParseCIDR(addr.String())
+			if err != nil {
+				ipstr = addr.String()
+
+			} else {
+				ipstr = ip.String()
+			}
+			if ipstr == udp.LocalAddr().(*net.UDPAddr).IP.String() {
+				iface = i
+			}
+
+		}
+	}
+	if iface.Name == "" {
+		err = errors.New("cannot find correct interface")
+		return
+	}
+	sniffer, err := bsdbpf.NewBPFSniffer(iface.Name, &bsdbpf.Options{
+		BPFDeviceName:    "",
+		ReadBufLen:       65536,
+		Timeout:          &syscall.Timeval{Sec: 0, Usec: 1000}, // 0.001s
+		Promisc:          false,
+		Immediate:        true,
+		PreserveLinkAddr: true,
+	})
+	if err != nil {
+		return
+	}
+	conn = &RAWConn{
+		sniffer:    sniffer,
+		buffer:     gopacket.NewSerializeBuffer(),
+		isLoopBack: udp.LocalAddr().(*net.UDPAddr).IP.IsLoopback(),
+		packets:    make(chan gopacket.Packet),
+		opts: gopacket.SerializeOptions{
+			FixLengths:       true,
+			ComputeChecksums: true,
+		},
+		r: r,
+		layer: &pktLayers{
+			ip4: &layers.IPv4{
+				SrcIP:    udp.LocalAddr().(*net.UDPAddr).IP,
+				DstIP:    udp.RemoteAddr().(*net.UDPAddr).IP,
+				Protocol: layers.IPProtocolTCP,
+				Version:  0x4,
+				Id:       uint16(ran.Int63() % 65536),
+				Flags:    layers.IPv4DontFragment,
+				TTL:      0x40,
+				TOS:      uint8(r.DSCP),
+			},
+			tcp: &layers.TCP{
+
+				SrcPort: layers.TCPPort(udp.LocalAddr().(*net.UDPAddr).Port),
+				DstPort: layers.TCPPort(udp.RemoteAddr().(*net.UDPAddr).Port),
+				Window:  12580,
+				Ack:     0,
+			},
+		},
+		die:   make(chan struct{}),
+		rcond: &sync.Cond{L: &sync.Mutex{}},
+		sip:   udp.RemoteAddr().(*net.UDPAddr).IP,
+		sport: udp.RemoteAddr().(*net.UDPAddr).Port,
+		dip:   udp.LocalAddr().(*net.UDPAddr).IP,
+		dport: udp.LocalAddr().(*net.UDPAddr).Port,
+		udp:   udp,
+	}
+	udp = nil
+	defer func() {
+		if err != nil {
+			conn.Close()
+		} else {
+			conn.nocopy = true
+		}
+	}()
+	var eth *layers.Ethernet
+	if !conn.isLoopBack {
+		conn.linktype = layers.LinkTypeEthernet
+
+		buf := make([]byte, 32)
+		binary.Read(rand.Reader, binary.LittleEndian, buf)
+		var uconn *net.UDPConn
+		uconn, err = net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(8, 8, buf[0], buf[1]), Port: int(binary.LittleEndian.Uint16(buf[2:4]))})
+		if err != nil {
+			return
+		}
+		defer uconn.Close()
+
+		sigch := make(chan bool)
+
+		go func() {
+			<-sigch
+			_, err = uconn.Write(buf)
+			if err != nil {
+				return
+			}
+		}()
+
+		conn.SetReadDeadline(time.Now().Add(time.Second * 2))
+
+		var packet gopacket.Packet
+		packet, err = conn.readPacket()
+		if err != nil {
+			return
+		}
+
+		ethLayer := packet.Layer(layers.LayerTypeEthernet)
+		if ethLayer != nil {
+			eth, _ = ethLayer.(*layers.Ethernet)
+		}
+	} else {
+		conn.linktype = layers.LinkTypeLoop
+	}
+	conn.layer.eth = eth
+	if conn.layer.eth != nil {
+		conn.layer.eth.SrcMAC, conn.layer.eth.DstMAC = conn.layer.eth.DstMAC, conn.layer.eth.SrcMAC
+	}
+	if conn.isLoopBack {
+		err = conn.sniffer.SetBpf([]syscall.BpfInsn{
+			{0x20, 0, 0, 0x00000000},
+			{0x15, 15, 0, 0x1e000000},
+			{0x15, 0, 14, 0x02000000},
+			{0x30, 0, 0, 0x0000000d},
+			{0x15, 0, 12, 0x00000006},
+			{0x20, 0, 0, 0x00000010},
+			{0x15, 0, 10, binary.BigEndian.Uint32([]byte(conn.sip.To4()))},
+			{0x28, 0, 0, 0x0000000a},
+			{0x45, 8, 0, 0x00001fff},
+			{0xb1, 0, 0, 0x00000004},
+			{0x48, 0, 0, 0x00000004},
+			{0x15, 0, 5, uint32(conn.sport)},
+			{0x20, 0, 0, 0x00000014},
+			{0x15, 0, 3, binary.BigEndian.Uint32([]byte(conn.dip.To4()))},
+			{0x48, 0, 0, 0x00000006},
+			{0x15, 0, 1, uint32(conn.dport)},
+			{0x6, 0, 0, 0x00040000},
+			{0x6, 0, 0, 0x00000000},
+		})
+		if err != nil {
+			return
+		}
+	} else {
+		err = conn.sniffer.SetBpf([]syscall.BpfInsn{
+			{0x28, 0, 0, 0x0000000c},
+			{0x15, 15, 0, 0x000086dd},
+			{0x15, 0, 14, 0x00000800},
+			{0x30, 0, 0, 0x00000017},
+			{0x15, 0, 12, 0x00000006},
+			{0x20, 0, 0, 0x0000001a},
+			{0x15, 0, 10, binary.BigEndian.Uint32([]byte(conn.sip.To4()))},
+			{0x28, 0, 0, 0x00000014},
+			{0x45, 8, 0, 0x00001fff},
+			{0xb1, 0, 0, 0x0000000e},
+			{0x48, 0, 0, 0x0000000e},
+			{0x15, 0, 5, uint32(conn.sport)},
+			{0x20, 0, 0, 0x0000001e},
+			{0x15, 0, 3, binary.BigEndian.Uint32([]byte(conn.dip.To4()))},
+			{0x48, 0, 0, 0x00000010},
+			{0x15, 0, 1, uint32(conn.dport)},
+			{0x6, 0, 0, 0x00040000},
+			{0x6, 0, 0, 0x00000000},
+		})
+		if err != nil {
+			return
+		}
+	}
+	tcp := conn.layer.tcp
+	var cl *pktLayers
+	binary.Read(rand.Reader, binary.LittleEndian, &(conn.layer.tcp.Seq))
+	if runtime.GOOS == "darwin" {
+		cmd := exec.Command("sh", "-c", fmt.Sprintf("echo block drop out proto tcp from %s port %d to %s port %d flags R/R >> /etc/pf.conf && pfctl -f /etc/pf.conf",
+			conn.dip.String(), conn.dport, conn.sip.String(), conn.sport))
+		_, err = cmd.CombinedOutput()
+		if err == nil {
+			exec.Command("pfctl", "-e").Run()
+			cleaner := &utils.ExitCleaner{}
+			filename := randStringBytesMaskImprSrc(20)
+			clean := exec.Command("sh", "-c", fmt.Sprintf("cat /etc/pf.conf | grep -v "+
+				"'block drop out proto tcp from %s port %d to %s port %d flags R/R' > /tmp/%s.conf && mv /tmp/%s.conf /etc/pf.conf"+
+				" && pfctl -f /etc/pf.conf",
+				conn.dip.String(), conn.dport, conn.sip.String(), conn.sport, filename, filename))
+			cleaner.Push(func() {
+				clean.Run()
+				exec.Command("pfctl", "-e").Run()
+			})
+			conn.cleaner = cleaner
+		}
+	} else if runtime.GOOS == "windows" {
+
+	}
+	retry := 0
+	var ackn uint32
+	var seqn uint32
+	defer func() { conn.SetDeadline(time.Time{}) }()
+	for {
+		if retry > 5 {
+			err = errors.New("retry too many times")
+			return
+		}
+		retry++
+		err = conn.sendSyn()
+		if err != nil {
+			return
+		}
+		conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(500+int(ran.Int63()%500))))
+		cl, err = conn.readLayers()
+		if err != nil {
+			e, ok := err.(net.Error)
+			if !ok || !e.Temporary() {
+				return
+			}
+			continue
+		}
+		if cl.tcp.SYN && cl.tcp.ACK {
+			tcp.Ack = cl.tcp.Seq + 1
+			tcp.Seq++
+			ackn = tcp.Ack
+			seqn = tcp.Seq
+			conn.mss = getMssFromTcpLayer(cl.tcp)
+			err = conn.sendAck()
+			if err != nil {
+				return
+			}
+		}
+		break
+	}
+	if r.NoHTTP {
+		return
+	}
+	retry = 0
+	var headers string
+	if len(r.Hosts) == 0 {
+		if len(r.Host) != 0 {
+			r.Hosts = strings.Split(r.Host, ",")
+		}
+	}
+	if len(r.Hosts) > 0 {
+		host := r.Hosts[ran.Int()%len(r.Hosts)]
+		headers += "Host: " + host + "\r\n"
+		headers += "X-Online-Host: " + host + "\r\n"
+	}
+	req := buildHTTPRequest(headers)
+	needretry := true
+	var starttime time.Time
+	for {
+		if retry > 25 {
+			err = errors.New("retry too many times")
+			return
+		}
+		if needretry {
+			needretry = false
+			starttime = time.Now()
+			retry++
+			_, err = conn.write([]byte(req))
+			if err != nil {
+				return
+			}
+		}
+		err = conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(200+int(ran.Int63()%100))))
+		if err != nil {
+			return
+		}
+		cl, err = conn.readLayers()
+		if err != nil {
+			e, ok := err.(net.Error)
+			if !ok || !e.Temporary() {
+				return
+			}
+			needretry = true
+			continue
+		}
+		if cl.tcp.SYN && cl.tcp.ACK {
+			tcp.Ack = ackn
+			tcp.Seq = seqn
+			err = conn.sendAck()
+			if err != nil {
+				return
+			}
+			continue
+		}
+		n := len(cl.tcp.Payload)
+		if cl.tcp.PSH && cl.tcp.ACK && n >= 20 {
+			head := string(cl.tcp.Payload[:4])
+			tail := string(cl.tcp.Payload[n-4:])
+			if head == "HTTP" && tail == "\r\n\r\n" {
+				conn.hseqn = cl.tcp.Seq
+				tcp.Seq += uint32(len(req))
+				tcp.Ack = cl.tcp.Seq + uint32(n)
+				break
+			}
+		}
+		if time.Now().After(starttime.Add(time.Millisecond * 200)) {
+			needretry = true
+		}
+	}
+	return
 }
 
 type RAWListener struct {
 	*RAWConn
-	newcons map[string]*connInfo
-	conns   map[string]*connInfo
-	mutex   myMutex
-	laddr   *net.IPAddr
-	lport   int
+	newcons     map[string]*connInfo
+	conns       map[string]*connInfo
+	mutex       myMutex
+	laddr       *net.IPAddr
+	lport       int
+	tcpListener net.Listener
 }
 
 func (listener *RAWListener) GetMSSByAddr(addr net.Addr) int {
@@ -858,6 +1100,9 @@ func (listener *RAWListener) Close() (err error) {
 	// 		}
 	// 	})
 	// }
+	if listener.tcpListener != nil {
+		listener.tcpListener.Close()
+	}
 	return conn.RAWConn.Close()
 }
 
@@ -866,6 +1111,166 @@ func (listener *RAWListener) closeConn(info *connInfo) (err error) {
 }
 
 func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
+	udpaddr, err := net.ResolveUDPAddr("udp4", address)
+	if err != nil {
+		return
+	}
+	if udpaddr.IP == nil || udpaddr.IP.Equal(net.IPv4(0, 0, 0, 0)) {
+		udpaddr.IP = net.IPv4(127, 0, 0, 1)
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return
+	}
+	var iface net.Interface
+	for _, i := range ifaces {
+		addrs, err := i.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ipstr string
+			ip, _, err := net.ParseCIDR(addr.String())
+			if err != nil {
+				ipstr = addr.String()
+
+			} else {
+				ipstr = ip.String()
+			}
+			if ipstr == udpaddr.IP.String() {
+				iface = i
+			}
+		}
+	}
+	if iface.Name == "" {
+		err = errors.New("cannot find correct interface")
+		return
+	}
+	sniffer, err := bsdbpf.NewBPFSniffer(iface.Name, &bsdbpf.Options{
+		BPFDeviceName:    "",
+		ReadBufLen:       65536,
+		Timeout:          &syscall.Timeval{Sec: 0, Usec: 1000}, // 0.001s
+		Promisc:          false,
+		Immediate:        true,
+		PreserveLinkAddr: true,
+	})
+	if err != nil {
+		return
+	}
+	listener = &RAWListener{
+		laddr: &net.IPAddr{IP: udpaddr.IP},
+		lport: udpaddr.Port,
+		RAWConn: &RAWConn{
+			sniffer:    sniffer,
+			buffer:     gopacket.NewSerializeBuffer(),
+			isLoopBack: udpaddr.IP.IsLoopback(),
+			packets:    make(chan gopacket.Packet),
+			opts: gopacket.SerializeOptions{
+				FixLengths:       true,
+				ComputeChecksums: true,
+			},
+			r:     r,
+			die:   make(chan struct{}),
+			rcond: &sync.Cond{L: &sync.Mutex{}},
+			dip:   udpaddr.IP,
+			dport: udpaddr.Port,
+		},
+		newcons: make(map[string]*connInfo),
+		conns:   make(map[string]*connInfo),
+	}
+	defer func() {
+		if err != nil && listener != nil {
+			listener.Close()
+			listener = nil
+		}
+	}()
+	if listener.isLoopBack {
+		listener.linktype = layers.LinkTypeLoop
+		err = listener.sniffer.SetBpf([]syscall.BpfInsn{
+			{0x20, 0, 0, 0x00000000},
+			{0x15, 11, 0, 0x1e000000},
+			{0x15, 0, 10, 0x02000000},
+			{0x30, 0, 0, 0x0000000d},
+			{0x15, 0, 8, 0x00000006},
+			{0x20, 0, 0, 0x00000014},
+			{0x15, 0, 6, binary.BigEndian.Uint32([]byte(listener.dip.To4()))},
+			{0x28, 0, 0, 0x0000000a},
+			{0x45, 4, 0, 0x00001fff},
+			{0xb1, 0, 0, 0x00000004},
+			{0x48, 0, 0, 0x00000006},
+			{0x15, 0, 1, uint32(listener.dport)},
+			{0x6, 0, 0, 0x00040000},
+			{0x6, 0, 0, 0x00000000},
+		})
+		if err != nil {
+			return
+		}
+	} else {
+		listener.linktype = layers.LinkTypeEthernet
+		err = listener.sniffer.SetBpf([]syscall.BpfInsn{
+			{0x28, 0, 0, 0x0000000c},
+			{0x15, 11, 0, 0x000086dd},
+			{0x15, 0, 10, 0x00000800},
+			{0x30, 0, 0, 0x00000017},
+			{0x15, 0, 8, 0x00000006},
+			{0x20, 0, 0, 0x0000001e},
+			{0x15, 0, 6, binary.BigEndian.Uint32([]byte(listener.dip.To4()))},
+			{0x28, 0, 0, 0x00000014},
+			{0x45, 4, 0, 0x00001fff},
+			{0xb1, 0, 0, 0x0000000e},
+			{0x48, 0, 0, 0x00000010},
+			{0x15, 0, 1, uint32(listener.dport)},
+			{0x6, 0, 0, 0x00040000},
+			{0x6, 0, 0, 0x00000000},
+		})
+		if err != nil {
+			return
+		}
+	}
+	if !r.Dummy {
+		cmd := exec.Command("sh", "-c", fmt.Sprintf("echo block drop out proto tcp from %s port %d to any flags R/R >> /etc/pf.conf && pfctl -f /etc/pf.conf",
+			listener.laddr.String(), listener.lport))
+		_, err = cmd.CombinedOutput()
+		if err == nil {
+			exec.Command("pfctl", "-e").Run()
+			cleaner := &utils.ExitCleaner{}
+			filename := randStringBytesMaskImprSrc(20)
+			clean := exec.Command("sh", "-c", fmt.Sprintf("cat /etc/pf.conf | grep -v "+
+				"'block drop out proto tcp from %s port %d to any flags R/R' > /tmp/%s.conf && mv /tmp/%s.conf /etc/pf.conf"+
+				" && pfctl -f /etc/pf.conf",
+				listener.laddr.String(), listener.lport, filename, filename))
+			cleaner.Push(func() {
+				clean.Run()
+				exec.Command("pfctl", "-e").Run()
+			})
+			listener.cleaner = cleaner
+		}
+	} else {
+		listener.tcpListener, err = net.Listen("tcp", address)
+		if err != nil {
+			return
+		}
+		go func() {
+			buf := make([]byte, 512)
+			defer listener.tcpListener.Close()
+			for {
+				conn, err := listener.tcpListener.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					defer c.Close()
+					ipv4.NewConn(c).SetTTL(0)
+					for {
+						_, err := c.Read(buf)
+						if err != nil {
+							return
+						}
+					}
+				}(conn)
+			}
+		}()
+	}
 	return
 }
 

@@ -706,6 +706,11 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 	if err != nil {
 		return
 	}
+	defer func() {
+		if udp != nil {
+			udp.Close()
+		}
+	}()
 	ulocaladdr := udp.LocalAddr().(*net.UDPAddr)
 	localaddr := &net.IPAddr{IP: ulocaladdr.IP}
 	uremoteaddr := udp.RemoteAddr().(*net.UDPAddr)
@@ -759,6 +764,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		die:      make(chan struct{}),
 		rcond:    &sync.Cond{L: &sync.Mutex{}},
 	}
+	udp = nil
 	go conn.reader()
 	defer func() {
 		if err != nil {
@@ -1056,7 +1062,7 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 			cleaner := &utils.ExitCleaner{}
 			filename := randStringBytesMaskImprSrc(20)
 			clean := exec.Command("sh", "-c", fmt.Sprintf("cat /etc/pf.conf | grep -v "+
-				"'block drop out proto tcp from %s port %d to any flags R/R' > /tmp/%s.conf && mv /tmp/&s.conf /etc/pf.conf"+
+				"'block drop out proto tcp from %s port %d to any flags R/R' > /tmp/%s.conf && mv /tmp/%s.conf /etc/pf.conf"+
 				" && pfctl -f /etc/pf.conf",
 				listener.laddr.String(), listener.lport, filename, filename))
 			cleaner.Push(func() {

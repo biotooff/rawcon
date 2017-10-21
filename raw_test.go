@@ -21,6 +21,7 @@ func TestSingleEcho(t *testing.T) {
 		Mixed:  true,
 		NoHTTP: false,
 		IgnRST: true,
+		Dummy:  true,
 		Hosts: []string{
 			"www.baidu.com",
 			"www.google.com",
@@ -93,6 +94,7 @@ func TestMultiEcho(t *testing.T) {
 		Mixed:  true,
 		NoHTTP: false,
 		IgnRST: true,
+		Dummy:  true,
 		Hosts: []string{
 			"www.baidu.com",
 			"www.google.com",
