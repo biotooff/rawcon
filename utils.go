@@ -12,6 +12,7 @@ import (
 type Raw struct {
 	Mixed  bool
 	NoHTTP bool
+	TLS    bool
 	Host   string
 	DSCP   int
 	IgnRST bool

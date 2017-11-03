@@ -198,6 +198,14 @@ func (raw *RAWConn) writeWithLayer(b []byte, layer *pktLayers) (n int, err error
 }
 
 func (raw *RAWConn) Write(b []byte) (n int, err error) {
+	if raw.r.TLS {
+		buf := utils.GetBuf(len(b) + 5)
+		defer utils.PutBuf(buf)
+		copy(buf, []byte{0x17, 0x3, 0x3})
+		binary.BigEndian.PutUint16(buf[3:5], uint16(len(b)))
+		copy(buf[5:], b)
+		b = buf[:5+len(b)]
+	}
 	n, err = raw.write(b)
 	raw.layer.tcp.seqn += uint32(n)
 	return
@@ -298,7 +306,14 @@ func (raw *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 			if uint64(tcp.seqn)+uint64(n) > uint64(raw.layer.tcp.ackn) {
 				raw.layer.tcp.ackn = tcp.seqn + uint32(n)
 			}
-			n = copy(b, tcp.payload)
+			if raw.r.TLS {
+				if n < 5 {
+					continue
+				}
+				n = copy(b, tcp.payload[5:])
+			} else {
+				n = copy(b, tcp.payload)
+			}
 			raw.trySendAck(raw.layer)
 		}
 		return n, addr, err
@@ -441,22 +456,34 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 			break
 		}
 	}
-	if r.NoHTTP {
+	if r.NoHTTP && !r.TLS {
 		return
 	}
-	retry = 0
-	var headers string
+	var req []byte
+	var host string
 	if len(r.Hosts) == 0 {
 		if len(r.Host) != 0 {
 			r.Hosts = strings.Split(r.Host, ",")
 		}
 	}
 	if len(r.Hosts) > 0 {
-		host := r.Hosts[ran.Int()%len(r.Hosts)]
-		headers += "Host: " + host + "\r\n"
-		headers += "X-Online-Host: " + host + "\r\n"
+		host = r.Hosts[ran.Int()%len(r.Hosts)]
 	}
-	req := buildHTTPRequest(headers)
+	if r.TLS {
+		b := utils.GetBuf(2048)
+		defer utils.PutBuf(b)
+		utils.PutRandomBytes(b[1816:])
+		tlsLen := utils.GenTLSClientHello(b, host, b[2016:], b[1816:1816+ran.Intn(200)])
+		req = b[:tlsLen]
+	} else {
+		if uremoteaddr.Port != 80 {
+			host += strconv.Itoa(uremoteaddr.Port)
+		}
+		headers := "Host: " + host + "\r\n"
+		headers += "X-Online-Host: " + host + "\r\n"
+		req = utils.StringToSlice(buildHTTPRequest(headers))
+	}
+	retry = 0
 	needretry := true
 	var starttime time.Time
 	for {
@@ -468,7 +495,7 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 			needretry = false
 			starttime = time.Now()
 			retry++
-			_, err = raw.write([]byte(req))
+			_, err = raw.write(req)
 			if err != nil {
 				return
 			}
@@ -499,13 +526,23 @@ func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
 		}
 		n := len(tcp.payload)
 		if tcp.chkFlag(PSH|ACK) && n >= tcpLen {
-			head := string(tcp.payload[:4])
-			tail := string(tcp.payload[n-4:])
-			if head == "HTTP" && tail == "\r\n\r\n" {
-				layer.tcp.seqn += uint32(len(req))
-				layer.tcp.ackn = tcp.seqn + uint32(n)
-				raw.hseqn = tcp.seqn
-				break
+			if r.TLS {
+				ok, _, _ := utils.ParseTLSServerHelloMsg(tcp.payload)
+				if ok {
+					layer.tcp.seqn += uint32(len(req))
+					layer.tcp.ackn = tcp.seqn + uint32(n)
+					raw.hseqn = tcp.seqn
+					break
+				}
+			} else {
+				head := string(tcp.payload[:4])
+				tail := string(tcp.payload[n-4:])
+				if head == "HTTP" && tail == "\r\n\r\n" {
+					layer.tcp.seqn += uint32(len(req))
+					layer.tcp.ackn = tcp.seqn + uint32(n)
+					raw.hseqn = tcp.seqn
+					break
+				}
 			}
 		}
 		if time.Now().After(starttime.Add(time.Millisecond * 200)) {
@@ -662,9 +699,16 @@ func (listener *RAWListener) doRead(b []byte) (n int, addr *net.UDPAddr, err err
 			if info.state == httprepsent {
 				if tcp.chkFlag(PSH | ACK) {
 					if tcp.seqn == info.hseqn && n > 20 {
+						ok := false
+						if listener.r.TLS || listener.r.Mixed {
+							ok, _, _ = utils.ParseTLSClientHelloMsg(tcp.payload)
+						}
 						head := string(tcp.payload[:4])
 						tail := string(tcp.payload[n-4:])
-						if head == "POST" && tail == "\r\n\r\n" {
+						if !ok && head == "POST" && tail == "\r\n\r\n" {
+							ok = true
+						}
+						if ok {
 							t.ackn = tcp.seqn + uint32(n)
 							_, err = listener.writeWithLayer(info.rep, info.layer)
 							if err != nil {
@@ -682,7 +726,14 @@ func (listener *RAWListener) doRead(b []byte) (n int, addr *net.UDPAddr, err err
 				}
 			}
 			if info.state == established {
-				n = copy(b, tcp.payload)
+				if info.tls {
+					if len(tcp.payload) < 5 {
+						continue
+					}
+					n = copy(b, tcp.payload[5:])
+				} else {
+					n = copy(b, tcp.payload)
+				}
 				listener.trySendAck(info.layer)
 				return
 			}
@@ -719,15 +770,29 @@ func (listener *RAWListener) doRead(b []byte) (n int, addr *net.UDPAddr, err err
 				}
 			} else if info.state == waithttpreq {
 				if tcp.chkFlag(ACK|PSH) && n > 20 {
+					if listener.r.TLS || listener.r.Mixed {
+						ok, _, msg := utils.ParseTLSClientHelloMsg(tcp.payload)
+						if ok {
+							t.ackn = tcp.seqn + uint32(n)
+							if info.rep == nil {
+								rep := make([]byte, 2048)
+								l := ran.Intn(128)
+								n = utils.GenTLSServerHello(rep, l, msg.SessionId)
+								info.rep = rep[:l+n]
+							}
+							info.hseqn = tcp.seqn
+							info.tls = true
+						}
+					}
 					head := string(tcp.payload[:4])
 					tail := string(tcp.payload[n-4:])
-					if head == "POST" && tail == "\r\n\r\n" {
+					if info.rep == nil && head == "POST" && tail == "\r\n\r\n" {
 						t.ackn = tcp.seqn + uint32(n)
-						if info.rep == nil {
-							rep := buildHTTPResponse("")
-							info.rep = []byte(rep)
-						}
+						rep := buildHTTPResponse("")
+						info.rep = []byte(rep)
 						info.hseqn = tcp.seqn
+					}
+					if info.rep != nil {
 						_, err = listener.writeWithLayer(info.rep, info.layer)
 						if err != nil {
 							return
@@ -817,6 +882,14 @@ func (listener *RAWListener) WriteTo(b []byte, addr net.Addr) (n int, err error)
 	if !ok {
 		return 0, errors.New("cannot write to " + addr.String())
 	}
+	if info.tls {
+		buf := utils.GetBuf(len(b) + 5)
+		defer utils.PutBuf(buf)
+		copy(buf, []byte{0x17, 0x3, 0x3})
+		binary.BigEndian.PutUint16(buf[3:5], uint16(len(b)))
+		copy(buf[5:], b)
+		b = buf[:5+len(b)]
+	}
 	n, err = listener.writeWithLayer(b, info.layer)
 	info.layer.tcp.seqn += uint32(n)
 	return
@@ -835,6 +908,7 @@ type connInfo struct {
 	rep   []byte
 	hseqn uint32
 	mss   int
+	tls   bool
 }
 
 // copy from github.com/google/gopacket/layers/tcp.go
