@@ -17,8 +17,8 @@ import (
 
 	ran "math/rand"
 
-	"github.com/ccsexyz/gopacket/layers"
-	"github.com/ccsexyz/gopacket/pcap"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"github.com/ccsexyz/utils"
 	"github.com/google/gopacket"
 	"golang.org/x/net/ipv4"
@@ -141,6 +141,7 @@ func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 		var packet gopacket.Packet
 		packet, err = conn.readPacket()
 		if err != nil {
+			fmt.Println("readPacket",err)
 			return
 		}
 		var eth *layers.Ethernet
@@ -367,15 +368,15 @@ func (conn *RAWConn) Write(b []byte) (n int, err error) {
 }
 
 func (conn *RAWConn) trySendAck(layer *pktLayers) {
-	now := time.Now()
-	if layer.tcp.Ack < layer.lastack+16384 {
-		if now.Sub(layer.lastacktime) < time.Millisecond*time.Duration(10) {
-			return
-		}
-	}
-	layer.lastack = layer.tcp.Ack
-	layer.lastacktime = now
-	conn.sendAckWithLayer(layer)
+	// now := time.Now()
+	// if layer.tcp.Ack < layer.lastack+16384 {
+	// 	if now.Sub(layer.lastacktime) < time.Millisecond*time.Duration(10) {
+	// 		return
+	// 	}
+	// }
+	// layer.lastack = layer.tcp.Ack
+	// layer.lastacktime = now
+	// conn.sendAckWithLayer(layer)
 }
 
 func (conn *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
@@ -502,7 +503,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		err = errors.New("cannot find correct interface")
 		return
 	}
-	handle, err := pcap.OpenLive(ifaceName, 65536, true, time.Millisecond)
+	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
 	if err != nil {
 		return
 	}
@@ -722,7 +723,7 @@ out:
 				break out
 			}
 		}
-		if time.Now().After(starttime.Add(time.Millisecond * 200)) {
+		if time.Now().After(starttime.Add(time.Millisecond * 500)) {
 			needretry = true
 		}
 	}
@@ -762,7 +763,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		err = errors.New("cannot find correct interface")
 		return
 	}
-	handle, err := pcap.OpenLive(ifaceName, 65536, true, time.Millisecond)
+	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
 	if err != nil {
 		return
 	}
@@ -1080,7 +1081,7 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	if err != nil {
 		return
 	}
-	handle, err := pcap.OpenLive(in.Name, 65536, true, time.Millisecond*1)
+	handle, err := pcap.OpenLive(in.Name, 65536, true, pcap.BlockForever)
 	if err != nil {
 		return
 	}
@@ -1104,6 +1105,7 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 				ComputeChecksums: true,
 			},
 			r: r,
+			rcond:    &sync.Cond{L: &sync.Mutex{}},
 		},
 		newcons: make(map[string]*connInfo),
 		conns:   make(map[string]*connInfo),

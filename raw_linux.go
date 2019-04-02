@@ -235,6 +235,7 @@ func (raw *RAWConn) ReadTCPLayer() (tcp *tcpLayer, addr *net.UDPAddr, err error)
 				continue
 			} else {
 				err = fmt.Errorf("connect reset by peer %s", addr.String())
+				fmt.Println(err)
 			}
 		}
 		addr = &net.UDPAddr{
@@ -325,15 +326,15 @@ func (raw *RAWConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 }
 
 func (raw *RAWConn) trySendAck(layer *pktLayers) {
-	now := time.Now()
-	if layer.tcp.ackn < layer.lastack+16384 {
-		if now.Sub(layer.lastacktime) < time.Millisecond*time.Duration(10) {
-			return
-		}
-	}
-	layer.lastack = layer.tcp.ackn
-	layer.lastacktime = now
-	raw.sendAckWithLayer(layer)
+	// now := time.Now()
+	// if layer.tcp.ackn < layer.lastack+16384 {
+	// 	if now.Sub(layer.lastacktime) < time.Millisecond*time.Duration(10) {
+	// 		return
+	// 	}
+	// }
+	// layer.lastack = layer.tcp.ackn
+	// layer.lastacktime = now
+	// raw.sendAckWithLayer(layer)
 }
 
 func (r *Raw) DialRAW(address string) (raw *RAWConn, err error) {
