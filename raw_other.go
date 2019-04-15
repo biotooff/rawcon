@@ -84,6 +84,8 @@ func (conn *RAWConn) reader() {
 		conn.rcond.L.Unlock()
 		data, _, err := conn.handle.ZeroCopyReadPacketData()
 		if err != nil {
+			fmt.Println("ZeroCopyReadPacketData",err)
+			//continue
 			select {
 			case <-conn.die:
 			case conn.errch <- err:
@@ -503,7 +505,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		err = errors.New("cannot find correct interface")
 		return
 	}
-	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(ifaceName, 2000, false, pcap.BlockForever)
 	if err != nil {
 		return
 	}
@@ -763,7 +765,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		err = errors.New("cannot find correct interface")
 		return
 	}
-	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(ifaceName, 2000, false, pcap.BlockForever)
 	if err != nil {
 		return
 	}
@@ -1081,7 +1083,7 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	if err != nil {
 		return
 	}
-	handle, err := pcap.OpenLive(in.Name, 65536, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(in.Name, 2000, false, pcap.BlockForever)
 	if err != nil {
 		return
 	}
