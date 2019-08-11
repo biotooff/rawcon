@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/gopacket/bsdbpf"
 	"github.com/google/gopacket/layers"
-	"github.com/ccsexyz/utils"
+	"github.com/biotooff/rawcon/utils"
 	"github.com/google/gopacket"
 	"golang.org/x/net/ipv4"
 )
