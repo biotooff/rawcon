@@ -24,6 +24,8 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
+const maxCapLimit int32 = 1300
+
 type RAWConn struct {
 	udp        net.Conn
 	tcp        net.Conn
@@ -64,114 +66,45 @@ func getMssFromTcpLayer(tcp *layers.TCP) int {
 	return 0
 }
 
-func (conn *RAWConn) reader() {
-	rver := uint64(0)
-	for {
-		conn.rcond.L.Lock()
-		for {
-			select {
-			default:
-			case <-conn.die:
-				conn.rcond.L.Unlock()
-				return
-			}
-			if conn.rver > rver {
-				rver = conn.rver
-				break
-			}
-			conn.rcond.Wait()
-		}
-		conn.rcond.L.Unlock()
-		data, _, err := conn.handle.ZeroCopyReadPacketData()
-		if err != nil {
-			fmt.Println("ZeroCopyReadPacketData",err)
-			//continue
-			select {
-			case <-conn.die:
-			case conn.errch <- err:
-			}
-			return
-		}
-		packet := gopacket.NewPacket(data, conn.linktype, gopacket.DecodeOptions{NoCopy: conn.nocopy, Lazy: true})
-		// log.Println(packet)
-		select {
-		case <-conn.die:
-			return
-		case conn.packets <- packet:
-		}
-	}
-}
-
-func (conn *RAWConn) notifyReader() {
-	conn.rcond.L.Lock()
-	defer conn.rcond.L.Unlock()
-	conn.rver++
-	conn.rcond.Signal()
-}
-
 func (conn *RAWConn) readPacket() (packet gopacket.Packet, err error) {
-	select {
-	default:
-	case packet = <-conn.packets:
+	var data [] byte
+	data, _, err = conn.handle.ZeroCopyReadPacketData()
+	if err != nil {
 		return
 	}
+	packet = gopacket.NewPacket(data, conn.linktype, gopacket.DecodeOptions{NoCopy: conn.nocopy, Lazy: true})
+	return
+}
 
-	conn.notifyReader()
-
-	var timeoutch <-chan time.Time
-	if conn.rtimer != nil {
-		timeoutch = conn.rtimer.C
-	}
-
-	var ok bool
-	select {
-	case <-timeoutch:
-		err = &timeoutErr{
-			op: "read from " + conn.RemoteAddr().String(),
-		}
-	case err = <-conn.errch:
-	case packet, ok = <-conn.packets:
-		if packet == nil || ok == false {
-			err = fmt.Errorf("read from closed connection")
-		}
-	}
+func (conn *RAWConn) readBytesOfPacket() (data [] byte, err error) {
+	data, _, err = conn.handle.ZeroCopyReadPacketData()
 	return
 }
 
 func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 	for {
-		var packet gopacket.Packet
-		packet, err = conn.readPacket()
+		var bytes [] byte
+		bytes, err = conn.readBytesOfPacket()
 		if err != nil {
 			fmt.Println("readPacket",err)
 			return
 		}
-		var eth *layers.Ethernet
-		var ethLayer, loopLayer gopacket.Layer
-		if conn.isLoopBack {
-			loopLayer = packet.Layer(layers.LayerTypeLoopback)
-		} else {
-			ethLayer = packet.Layer(layers.LayerTypeEthernet)
-			eth, _ = ethLayer.(*layers.Ethernet)
-		}
-		if ethLayer == nil && loopLayer == nil {
-			continue
-		}
-		ipLayer := packet.Layer(layers.LayerTypeIPv4)
-		if ipLayer == nil {
-			continue
-		}
-		ip4, _ := ipLayer.(*layers.IPv4)
-		tcpLayer := packet.Layer(layers.LayerTypeTCP)
-		if tcpLayer == nil {
-			continue
-		}
-		tcp, _ := tcpLayer.(*layers.TCP)
+
+		var eth layers.Ethernet
+  		var ip4 layers.IPv4
+  		var	tcp layers.TCP
+  		var payload gopacket.Payload
+  		parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &tcp, &payload)
+		decoded :=[]gopacket.LayerType{}
+		if err = parser.DecodeLayers(bytes, &decoded); err != nil {
+	      	fmt.Println("Could not decode layers: ", err)
+	      	continue
+    	}
 		if conn.r.IgnRST && tcp.RST {
 			continue
 		}
 		layer = &pktLayers{
-			eth: eth, ip4: ip4, tcp: tcp,
+			eth: &eth, ip4: &ip4, tcp: &tcp, payload : payload,
 		}
 		return
 	}
@@ -222,11 +155,11 @@ func (conn *RAWConn) sendPacketWithLayer(layer *pktLayers) (err error) {
 	if layer.eth != nil {
 		err = gopacket.SerializeLayers(buffer, opts,
 			layer.eth, layer.ip4,
-			layer.tcp, gopacket.Payload(layer.tcp.Payload))
+			layer.tcp, gopacket.Payload(layer.payload))
 	} else {
 		err = gopacket.SerializeLayers(buffer, opts,
 			&layers.Loopback{Family: layers.ProtocolFamilyIPv4}, layer.ip4,
-			layer.tcp, gopacket.Payload(layer.tcp.Payload))
+			layer.tcp, gopacket.Payload(layer.payload))
 	}
 	if err == nil {
 		err = conn.handle.WritePacketData(buffer.Bytes())
@@ -343,8 +276,8 @@ func (conn *RAWConn) writeWithLayer(b []byte, layer *pktLayers) (n int, err erro
 	tcp := layer.tcp
 	tcp.PSH = true
 	tcp.ACK = true
-	tcp.Payload = b
-	defer func() { tcp.Payload = nil }()
+	layer.payload = b
+	defer func() { layer.payload = nil }()
 	return n, conn.sendPacketWithLayer(layer)
 }
 
@@ -414,7 +347,7 @@ func (conn *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				Port: int(tcp.SrcPort),
 			}
 		}
-		n = len(tcp.Payload)
+		n = len(layer.payload)
 		if n > 0 {
 			if uint64(tcp.Seq)+uint64(n) > uint64(conn.layer.tcp.Ack) {
 				conn.layer.tcp.Ack = tcp.Seq + uint32(n)
@@ -423,9 +356,9 @@ func (conn *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				if n < 5 {
 					continue
 				}
-				n = copy(b, tcp.Payload[5:])
+				n = copy(b, layer.payload[5:])
 			} else {
-				n = copy(b, tcp.Payload)
+				n = copy(b, layer.payload)
 			}
 			conn.trySendAck(conn.layer)
 		}
@@ -505,7 +438,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		err = errors.New("cannot find correct interface")
 		return
 	}
-	handle, err := pcap.OpenLive(ifaceName, 2000, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(ifaceName, maxCapLimit, false, pcap.BlockForever)
 	if err != nil {
 		return
 	}
@@ -537,7 +470,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		die:      make(chan struct{}),
 		rcond:    &sync.Cond{L: &sync.Mutex{}},
 	}
-	go conn.reader()
+	//go conn.reader()
 	defer func() {
 		if err != nil {
 			conn.Close()
@@ -706,14 +639,14 @@ out:
 			needretry = true
 			continue out
 		}
-		n := len(cl.tcp.Payload)
+		n := len(cl.payload)
 		if cl.tcp.PSH && cl.tcp.ACK && n >= 20 {
 			var ok bool
 			if r.TLS {
-				ok, _, _ = utils.ParseTLSServerHelloMsg(cl.tcp.Payload)
+				ok, _, _ = utils.ParseTLSServerHelloMsg(cl.payload)
 			} else {
-				head := string(cl.tcp.Payload[:4])
-				tail := string(cl.tcp.Payload[n-4:])
+				head := string(cl.payload[:4])
+				tail := string(cl.payload[n-4:])
 				if head == "HTTP" && tail == "\r\n\r\n" {
 					ok = true
 				}
@@ -765,7 +698,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		err = errors.New("cannot find correct interface")
 		return
 	}
-	handle, err := pcap.OpenLive(ifaceName, 2000, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(ifaceName, maxCapLimit, false, pcap.BlockForever)
 	if err != nil {
 		return
 	}
@@ -803,7 +736,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		rcond:    &sync.Cond{L: &sync.Mutex{}},
 	}
 	udp = nil
-	go conn.reader()
+	//go conn.reader()
 	defer func() {
 		if err != nil {
 			conn.Close()
@@ -990,14 +923,14 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 			}
 			continue
 		}
-		n := len(cl.tcp.Payload)
+		n := len(cl.payload)
 		if cl.tcp.PSH && cl.tcp.ACK && n >= 20 {
 			var ok bool
 			if r.TLS {
-				ok, _, _ = utils.ParseTLSServerHelloMsg(cl.tcp.Payload)
+				ok, _, _ = utils.ParseTLSServerHelloMsg(cl.payload)
 			} else {
-				head := string(cl.tcp.Payload[:4])
-				tail := string(cl.tcp.Payload[n-4:])
+				head := string(cl.payload[:4])
+				tail := string(cl.payload[n-4:])
 				if head == "HTTP" && tail == "\r\n\r\n" {
 					ok = true
 				}
@@ -1083,7 +1016,7 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	if err != nil {
 		return
 	}
-	handle, err := pcap.OpenLive(in.Name, 2000, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(in.Name, maxCapLimit, false, pcap.BlockForever)
 	if err != nil {
 		return
 	}
@@ -1179,7 +1112,7 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 		listener.mutex.run(func() {
 			info, ok = listener.conns[addrstr]
 		})
-		n = len(tcp.Payload)
+		n = len(cl.payload)
 		if ok && n != 0 {
 			if uint64(tcp.Seq)+uint64(n) > uint64(info.layer.tcp.Ack) {
 				info.layer.tcp.Ack = tcp.Seq + uint32(n)
@@ -1189,10 +1122,10 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 					if tcp.Seq == info.hseqn && n > 20 {
 						ok := false
 						if listener.r.TLS || listener.r.Mixed {
-							ok, _, _ = utils.ParseTLSClientHelloMsg(tcp.Payload)
+							ok, _, _ = utils.ParseTLSClientHelloMsg(cl.payload)
 						} else {
-							head := string(tcp.Payload[:4])
-							tail := string(tcp.Payload[n-4:])
+							head := string(cl.payload[:4])
+							tail := string(cl.payload[n-4:])
 							if head == "POST" && tail == "\r\n\r\n" {
 								ok = true
 							}
@@ -1217,12 +1150,12 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 			}
 			if info.state == established {
 				if info.tls {
-					if len(tcp.Payload) < 5 {
+					if len(cl.payload) < 5 {
 						continue
 					}
-					n = copy(b, tcp.Payload[5:])
+					n = copy(b, cl.payload[5:])
 				} else {
-					n = copy(b, tcp.Payload)
+					n = copy(b, cl.payload)
 				}
 				return
 			}
@@ -1260,7 +1193,7 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 			} else if info.state == waithttpreq {
 				if tcp.PSH && tcp.ACK && n > 20 {
 					if listener.r.TLS || listener.r.Mixed {
-						ok, _, msg := utils.ParseTLSClientHelloMsg(tcp.Payload)
+						ok, _, msg := utils.ParseTLSClientHelloMsg(cl.payload)
 						if ok {
 							info.layer.tcp.Ack += uint32(n)
 							if info.rep == nil {
@@ -1272,8 +1205,8 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 							info.hseqn = tcp.Seq
 						}
 					}
-					head := string(tcp.Payload[:4])
-					tail := string(tcp.Payload[n-4:])
+					head := string(cl.payload[:4])
+					tail := string(cl.payload[n-4:])
 					if info.rep == nil && head == "POST" && tail == "\r\n\r\n" {
 						info.layer.tcp.Ack += uint32(n)
 						if info.rep == nil {
@@ -1299,7 +1232,7 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 							listener.conns[addrstr] = info
 							delete(listener.newcons, addrstr)
 						})
-						n = copy(b, tcp.Payload)
+						n = copy(b, cl.payload)
 						return
 					}
 				} else if tcp.SYN && !tcp.ACK && !tcp.PSH {
@@ -1390,6 +1323,7 @@ type pktLayers struct {
 	eth         *layers.Ethernet
 	ip4         *layers.IPv4
 	tcp         *layers.TCP
+	payload 	gopacket.Payload
 	lastack     uint32
 	lastacktime time.Time
 }
