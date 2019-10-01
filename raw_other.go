@@ -25,6 +25,7 @@ import (
 )
 
 const maxCapLimit int32 = 1300
+const maxLayersChanLen int32 = 1000
 
 type RAWConn struct {
 	udp        net.Conn
@@ -34,7 +35,7 @@ type RAWConn struct {
 	opts       gopacket.SerializeOptions
 	buffer     gopacket.SerializeBuffer
 	cleaner    *utils.ExitCleaner
-	packets    chan gopacket.Packet
+	layersChan chan *pktLayers
 	rtimer     *time.Timer
 	wtimer     *time.Timer
 	layer      *pktLayers
@@ -81,33 +82,37 @@ func (conn *RAWConn) readBytesOfPacket() (data [] byte, err error) {
 	return
 }
 
-func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
-	for {
-		var bytes [] byte
-		bytes, err = conn.readBytesOfPacket()
-		if err != nil {
-			fmt.Println("readPacket",err)
-			return
-		}
+func (conn *RAWConn) reader() {
+	var eth layers.Ethernet
+	var ip4 layers.IPv4
+	var	tcp layers.TCP
+	var payload gopacket.Payload
+	var parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &tcp, &payload)
+	var decoded []gopacket.LayerType = make([]gopacket.LayerType, 4)
 
-		var eth layers.Ethernet
-  		var ip4 layers.IPv4
-  		var	tcp layers.TCP
-  		var payload gopacket.Payload
-  		parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &tcp, &payload)
-		decoded :=[]gopacket.LayerType{}
-		if err = parser.DecodeLayers(bytes, &decoded); err != nil {
+	for{
+		buffer, err := conn.readBytesOfPacket()
+		if err = parser.DecodeLayers(buffer, &decoded); err != nil {
 	      	fmt.Println("Could not decode layers: ", err)
 	      	continue
     	}
-		if conn.r.IgnRST && tcp.RST {
+    	if conn.r.IgnRST && tcp.RST {
 			continue
 		}
-		layer = &pktLayers{
+		layer := &pktLayers{
 			eth: &eth, ip4: &ip4, tcp: &tcp, payload : payload,
 		}
-		return
+		select{
+			case <-conn.die: return
+			default: conn.layersChan <- layer
+		}
 	}
+}
+
+func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
+	err = nil
+	layer = <- conn.layersChan
+	return
 }
 
 func (conn *RAWConn) Close() (err error) {
@@ -452,7 +457,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		buffer:     gopacket.NewSerializeBuffer(),
 		handle:     handle,
 		isLoopBack: udp.LocalAddr().(*net.UDPAddr).IP.IsLoopback(),
-		packets:    make(chan gopacket.Packet),
+		layersChan: make(chan *pktLayers, maxLayersChanLen),
 		opts: gopacket.SerializeOptions{
 			FixLengths:       true,
 			ComputeChecksums: true,
@@ -470,7 +475,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		die:      make(chan struct{}),
 		rcond:    &sync.Cond{L: &sync.Mutex{}},
 	}
-	//go conn.reader()
+	go conn.reader()
 	defer func() {
 		if err != nil {
 			conn.Close()
@@ -707,7 +712,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		buffer:     gopacket.NewSerializeBuffer(),
 		handle:     handle,
 		isLoopBack: udp.LocalAddr().(*net.UDPAddr).IP.IsLoopback(),
-		packets:    make(chan gopacket.Packet),
+		layersChan: make(chan *pktLayers, maxLayersChanLen),
 		opts: gopacket.SerializeOptions{
 			FixLengths:       true,
 			ComputeChecksums: true,
@@ -736,7 +741,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		rcond:    &sync.Cond{L: &sync.Mutex{}},
 	}
 	udp = nil
-	//go conn.reader()
+	
 	defer func() {
 		if err != nil {
 			conn.Close()
@@ -788,6 +793,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 			return
 		}
 	}
+	go conn.reader()
 	conn.layer.eth = eth
 	filter := "tcp and src host " + remoteaddr.String() +
 		" and src port " + strconv.Itoa(uremoteaddr.Port) +
@@ -1034,7 +1040,7 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 			buffer:  gopacket.NewSerializeBuffer(),
 			handle:  handle,
 			pktsrc:  pktsrc,
-			packets: pktsrc.Packets(),
+			layersChan: make(chan *pktLayers, maxLayersChanLen),
 			opts: gopacket.SerializeOptions{
 				FixLengths:       true,
 				ComputeChecksums: true,
