@@ -25,6 +25,7 @@ import (
 )
 
 const maxCapLimit int32 = 1300
+const maxCapTimeout time.Duration = pcap.BlockForever//time.Millisecond * 10//
 const maxLayersChanLen int32 = 1000
 
 type RAWConn struct {
@@ -89,45 +90,62 @@ func (conn *RAWConn) reader() {
 	var payload gopacket.Payload
 	var parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &tcp, &payload)
 	var decoded []gopacket.LayerType = make([]gopacket.LayerType, 4)
-
+	var buffer []byte
+	var err error
+	var layer *pktLayers
 	for{
-		buffer, err := conn.readBytesOfPacket()
+		buffer, err = conn.readBytesOfPacket()
+		if err !=nil{
+			errStr:=err.Error()
+			if errStr == "Timeout Expired" {
+				continue
+			}
+			if errStr != "EOF" {
+				conn.Close()
+				fmt.Println("pcap read err: ", err)
+			}
+			return
+		}
 		if err = parser.DecodeLayers(buffer, &decoded); err != nil {
+	      	conn.Close()
 	      	fmt.Println("Could not decode layers: ", err)
-	      	continue
+	      	return
     	}
     	if conn.r.IgnRST && tcp.RST {
 			continue
 		}
-		layer := &pktLayers{
+		layer = &pktLayers{
 			eth: &eth, ip4: &ip4, tcp: &tcp, payload : payload,
 		}
 		select{
 			case <-conn.die: return
-			default: conn.layersChan <- layer
+			case conn.layersChan <- layer:
 		}
 	}
 }
 
 func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
-	err = nil
-	layer = <- conn.layersChan
+	select{
+		case <-conn.die: 
+			err=errors.New("EOF")
+		case layer = <- conn.layersChan:
+	}
 	return
 }
 
 func (conn *RAWConn) Close() (err error) {
-	conn.lock.Lock()
-	defer conn.lock.Unlock()
 	if conn.die != nil {
 		select {
 		default:
-		case <-conn.die:
-			return
+		case <-conn.die: return
 		}
 	}
 	if conn.cleaner != nil {
 		conn.cleaner.Exit()
 		conn.cleaner = nil
+	}
+	if conn.die != nil {
+		close(conn.die)
 	}
 	if conn.udp != nil && conn.handle != nil {
 		// conn.sendFin()
@@ -141,14 +159,6 @@ func (conn *RAWConn) Close() (err error) {
 	if conn.handle != nil {
 		conn.handle.Close()
 	}
-	if conn.die != nil {
-		close(conn.die)
-	}
-	go func() {
-		conn.rcond.L.Lock()
-		defer conn.rcond.L.Unlock()
-		conn.rcond.Broadcast()
-	}()
 	return
 }
 
@@ -292,8 +302,7 @@ func (conn *RAWConn) write(b []byte) (n int, err error) {
 }
 
 func (conn *RAWConn) Write(b []byte) (n int, err error) {
-	conn.lock.Lock()
-	defer conn.lock.Unlock()
+	
 	if conn.r.TLS {
 		buf := utils.GetBuf(len(b) + 5)
 		defer utils.PutBuf(buf)
@@ -443,7 +452,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		err = errors.New("cannot find correct interface")
 		return
 	}
-	handle, err := pcap.OpenLive(ifaceName, maxCapLimit, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(ifaceName, maxCapLimit, false, maxCapTimeout)
 	if err != nil {
 		return
 	}
@@ -703,7 +712,7 @@ func (r *Raw) DialRAW(address string) (conn *RAWConn, err error) {
 		err = errors.New("cannot find correct interface")
 		return
 	}
-	handle, err := pcap.OpenLive(ifaceName, maxCapLimit, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(ifaceName, maxCapLimit, false, maxCapTimeout)
 	if err != nil {
 		return
 	}
@@ -1022,7 +1031,7 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 	if err != nil {
 		return
 	}
-	handle, err := pcap.OpenLive(in.Name, maxCapLimit, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(in.Name, maxCapLimit, false, maxCapTimeout)
 	if err != nil {
 		return
 	}
@@ -1324,7 +1333,6 @@ func (listener *RAWListener) LocalAddr() net.Addr {
 	}
 }
 
-// FIXME
 type pktLayers struct {
 	eth         *layers.Ethernet
 	ip4         *layers.IPv4
