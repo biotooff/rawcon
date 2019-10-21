@@ -26,7 +26,7 @@ import (
 
 const maxCapLimit int32 = 1300
 const maxCapTimeout time.Duration = pcap.BlockForever//time.Millisecond * 10//
-const maxLayersChanLen int32 = 1000
+const maxLayersChanLen int32 = 10000
 
 type RAWConn struct {
 	udp        net.Conn
@@ -111,8 +111,11 @@ func (conn *RAWConn) reader() {
 	      	fmt.Println("Could not decode layers: ", err)
 	      	return
     	}
-    	if conn.r.IgnRST && tcp.RST {
-			continue
+    	if tcp.RST {
+    		fmt.Println("RST recv",tcp.SrcPort,"->",tcp.DstPort)
+    		if conn.r.IgnRST {
+    			continue
+    		}
 		}
 		layer = &pktLayers{
 			eth: &eth, ip4: &ip4, tcp: &tcp, payload : payload,
@@ -1113,7 +1116,7 @@ func (listener *RAWListener) ReadFrom(b []byte) (n int, addr net.Addr, err error
 		}
 		addr = uaddr
 		addrstr := uaddr.String()
-		if (tcp.RST) || tcp.FIN {
+		if tcp.RST || tcp.FIN {
 			listener.mutex.run(func() {
 				err = listener.closeConnByAddr(addrstr)
 			})

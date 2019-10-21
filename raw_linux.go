@@ -230,6 +230,10 @@ func (raw *RAWConn) ReadTCPLayer() (tcp *tcpLayer, addr *net.UDPAddr, err error)
 		if tcp.dstPort != raw.dstport {
 			continue
 		}
+		addr = &net.UDPAddr{
+			IP:   ipaddr.IP,
+			Port: tcp.srcPort,
+		}
 		if tcp.chkFlag(RST) {
 			if raw.r.IgnRST {
 				continue
@@ -237,10 +241,6 @@ func (raw *RAWConn) ReadTCPLayer() (tcp *tcpLayer, addr *net.UDPAddr, err error)
 				err = fmt.Errorf("connect reset by peer %s", addr.String())
 				fmt.Println(err)
 			}
-		}
-		addr = &net.UDPAddr{
-			IP:   ipaddr.IP,
-			Port: tcp.srcPort,
 		}
 		return
 	}
