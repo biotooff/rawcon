@@ -22,6 +22,8 @@ import (
 
 type RAWConn struct {
 	conn    *net.IPConn
+	ipv4RawConn *ipv4.RawConn
+	ipv4RawId int
 	udp     net.Conn
 	layer   *pktLayers
 	buf     []byte
@@ -82,6 +84,22 @@ func (raw *RAWConn) sendPacketWithLayer(layer *pktLayers) (err error) {
 	data := layer.tcp.marshal(layer.ip4.srcip, layer.ip4.dstip)
 	if raw.udp != nil {
 		_, err = raw.conn.Write(data)
+	} else if raw.ipv4RawConn != nil {
+		raw.ipv4RawId++
+		header := &ipv4.Header{
+			Version:4,
+			Len:20,
+			TOS: 0x00,
+			TotalLen:len(data)+20,
+			ID:raw.ipv4RawId,
+			Flags:ipv4.DontFragment,
+			FragOff:0,
+			TTL:64,
+			Protocol:6,
+			Checksum:0,
+			Dst:layer.ip4.dstip,
+		}
+		err = raw.ipv4RawConn.WriteTo(header,data,nil)
 	} else {
 		_, err = raw.conn.WriteTo(data, &net.IPAddr{IP: layer.ip4.dstip})
 	}
@@ -584,22 +602,25 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 		return
 	}
 	isAddrAny := udpaddr.IP.Equal(ipv4AddrAny)
-	ipv4.NewPacketConn(conn).SetBPF([]bpf.RawInstruction{
-		{0x30, 0, 0, 0x00000009},
-		{0x15, 0, 8, 0x00000006},
-		{0x28, 0, 0, 0x00000006},
-		{0x45, 4, 0, 0x00001fff},
-		{0xb1, 0, 0, 0x00000000},
-		{0x48, 0, 0, 0x00000002},
-		{0x15, 2, 3, uint32(udpaddr.Port)},
-		{0x48, 0, 0, 0x00000000},
-		{0x15, 0, 1, uint32(udpaddr.Port)},
-		{0x6, 0, 0, 0x00040000},
-		{0x6, 0, 0, 0x00000000},
-	})
+	// ipv4.NewPacketConn(conn).SetBPF([]bpf.RawInstruction{
+	// 	{0x30, 0, 0, 0x00000009},
+	// 	{0x15, 0, 8, 0x00000006},
+	// 	{0x28, 0, 0, 0x00000006},
+	// 	{0x45, 4, 0, 0x00001fff},
+	// 	{0xb1, 0, 0, 0x00000000},
+	// 	{0x48, 0, 0, 0x00000002},
+	// 	{0x15, 2, 3, uint32(udpaddr.Port)},
+	// 	{0x48, 0, 0, 0x00000000},
+	// 	{0x15, 0, 1, uint32(udpaddr.Port)},
+	// 	{0x6, 0, 0, 0x00040000},
+	// 	{0x6, 0, 0, 0x00000000},
+	// })
+	ipv4RawConn,_ := ipv4.NewRawConn(conn)
 	listener = &RAWListener{
 		RAWConn: RAWConn{
 			conn:    conn,
+			ipv4RawConn: ipv4RawConn,
+			ipv4RawId: ran.Int(),
 			udp:     nil,
 			buf:     make([]byte, 2048),
 			layer:   nil,
@@ -838,7 +859,7 @@ func (listener *RAWListener) doRead(b []byte) (n int, addr *net.UDPAddr, err err
 			tcp: &tcpLayer{
 				srcPort: listener.laddr.Port,
 				dstPort: addr.Port,
-				window:  65535,
+				window:  12580,
 				ackn:    tcp.seqn + 1,
 				data:    make([]byte, 2048),
 			},
