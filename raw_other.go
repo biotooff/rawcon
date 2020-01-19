@@ -24,7 +24,7 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-const maxCapLimit int32 = 1300
+const maxCapLimit int32 = 1600
 const maxCapTimeout time.Duration = pcap.BlockForever//time.Millisecond * 10//
 const maxLayersChanLen int32 = 10000
 

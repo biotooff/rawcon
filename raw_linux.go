@@ -662,30 +662,30 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 			listener.cleaner = cleaner
 		}
 	}()
-	var cmd2 *exec.Cmd
-	if isAddrAny {
-		cmd2 = exec.Command("iptables", "-I", "INPUT", "-p", "tcp",
-			"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
-	} else {
-		cmd2 = exec.Command("iptables", "-I", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
-			"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
-	}
+	// var cmd2 *exec.Cmd
+	// if isAddrAny {
+	// 	cmd2 = exec.Command("iptables", "-I", "INPUT", "-p", "tcp",
+	// 		"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	// } else {
+	// 	cmd2 = exec.Command("iptables", "-I", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
+	// 		"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	// }
 
-	_, err = cmd2.CombinedOutput()
-	if err != nil {
-		return
-	}
-	var clean2 *exec.Cmd
-	if isAddrAny {
-		clean2 = exec.Command("iptables", "-D", "INPUT", "-p", "tcp",
-			"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
-	} else {
-		clean2 = exec.Command("iptables", "-D", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
-			"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
-	}
-	cleaner.Push(func() {
-		clean2.Run()
-	})
+	// _, err = cmd2.CombinedOutput()
+	// if err != nil {
+	// 	return
+	// }
+	// var clean2 *exec.Cmd
+	// if isAddrAny {
+	// 	clean2 = exec.Command("iptables", "-D", "INPUT", "-p", "tcp",
+	// 		"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	// } else {
+	// 	clean2 = exec.Command("iptables", "-D", "INPUT", "-p", "tcp", "-d", conn.LocalAddr().String(),
+	// 		"--dport", strconv.Itoa(udpaddr.Port), "-j", "ACCEPT")
+	// }
+	// cleaner.Push(func() {
+	// 	clean2.Run()
+	// })
 	return
 }
 
