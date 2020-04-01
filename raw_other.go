@@ -21,16 +21,15 @@ import (
 	"github.com/google/gopacket/pcap"
 	"github.com/biotooff/rawcon/utils"
 	"github.com/google/gopacket"
-	"golang.org/x/net/ipv4"
 )
 
 const maxCapLimit int32 = 1600
 const maxCapTimeout time.Duration = pcap.BlockForever//time.Millisecond * 10//
-const maxLayersChanLen int32 = 10000
+const maxLayersChanLen int32 = 2000
 
 type RAWConn struct {
 	udp        net.Conn
-	tcp        net.Conn
+	tcp        *net.TCPConn
 	handle     *pcap.Handle
 	pktsrc     *gopacket.PacketSource
 	opts       gopacket.SerializeOptions
@@ -92,18 +91,16 @@ func (conn *RAWConn) reader() {
 	var decoded []gopacket.LayerType = make([]gopacket.LayerType, 4)
 	var buffer []byte
 	var err error
-	var layer *pktLayers
 	for{
 		buffer, err = conn.readBytesOfPacket()
 		if err !=nil{
 			errStr:=err.Error()
 			if errStr == "Timeout Expired" {
+				fmt.Println("pcap read timeout")
 				continue
 			}
-			if errStr != "EOF" {
-				conn.Close()
-				fmt.Println("pcap read err: ", err)
-			}
+			conn.Close()
+			fmt.Println("pcap read err: ", err)
 			return
 		}
 		if err = parser.DecodeLayers(buffer, &decoded); err != nil {
@@ -117,7 +114,7 @@ func (conn *RAWConn) reader() {
     			continue
     		}
 		}
-		layer = &pktLayers{
+		layer := &pktLayers{
 			eth: &eth, ip4: &ip4, tcp: &tcp, payload : payload,
 		}
 		select{
@@ -496,7 +493,7 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		}
 	}()
 	var layersArray []*pktLayers
-	var tcpConn net.Conn
+	var tcpConn *net.TCPConn
 	var tcpConnErr error
 	var synAckLayer *pktLayers
 	var tcpLocalAddr *net.TCPAddr
@@ -504,7 +501,8 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 	sigch := make(chan bool)
 	go func() {
 		<-sigch
-		tcpConn, tcpConnErr = net.Dial("tcp4", address)
+		tcpRemoteAddr , _ =net.ResolveTCPAddr("tcp4",address)
+		tcpConn, tcpConnErr = net.DialTCP("tcp4",nil,tcpRemoteAddr)
 		if tcpConn != nil && tcpConnErr == nil {
 			tcpLocalAddr = tcpConn.LocalAddr().(*net.TCPAddr)
 			tcpRemoteAddr = tcpConn.RemoteAddr().(*net.TCPAddr)
@@ -559,7 +557,6 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		layersArray = append(layersArray, layer)
 	}
 	conn.SetReadDeadline(time.Time{})
-	ipv4.NewConn(tcpConn).SetTTL(0)
 	conn.layer = &pktLayers{
 		ip4: &layers.IPv4{
 			SrcIP:    tcpLocalAddr.IP,
@@ -586,7 +583,11 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 			DstMAC:       synAckLayer.eth.SrcMAC,
 		}
 	}
+	tcpConn.SetDeadline(time.Time{})
+	tcpConn.SetKeepAlive(false)
 	conn.tcp = tcpConn
+	//go io.Copy(ioutil.Discard, conn.tcp)
+	//ipv4.NewConn(tcpConn).SetTTL(0)
 	filter = "tcp and src host " + conn.layer.ip4.DstIP.String() +
 		" and src port " + strconv.Itoa(int(conn.layer.tcp.DstPort)) +
 		" and dst host " + conn.layer.ip4.SrcIP.String() +
@@ -1340,11 +1341,10 @@ type pktLayers struct {
 	eth         *layers.Ethernet
 	ip4         *layers.IPv4
 	tcp         *layers.TCP
-	payload 	gopacket.Payload
+	payload 	[]byte
 	lastack     uint32
 	lastacktime time.Time
 }
-
 type connInfo struct {
 	state uint32
 	layer *pktLayers
