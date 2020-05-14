@@ -88,7 +88,7 @@ var	tcp layers.TCP
 var payload gopacket.Payload
 var parser *gopacket.DecodingLayerParser
 var decoded []gopacket.LayerType = make([]gopacket.LayerType, 4)
-
+var buffer []byte = make([]byte, maxCapLimit)
 func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 	select{
 		case <-conn.die: 
@@ -104,7 +104,7 @@ func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 		parser.AddDecodingLayer(&tcp)
 		parser.AddDecodingLayer(&payload)
 	}
-	var buffer []byte
+	
 	for{
 		buffer, _, err = conn.handle.ZeroCopyReadPacketData()
 		if err !=nil{
@@ -363,9 +363,8 @@ func (conn *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				Port: int(tcp.SrcPort),
 			}
 		}
-		pl := layer.payload.Payload()
-		n = len(pl)
-		if n > 0 {
+		n = (int)(ip4.Length) - 52
+		if  n > 0 {
 			if uint64(tcp.Seq)+uint64(n) > uint64(conn.layer.tcp.Ack) {
 				conn.layer.tcp.Ack = tcp.Seq + uint32(n)
 			}
@@ -373,9 +372,9 @@ func (conn *RAWConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				if n < 5 {
 					continue
 				}
-				n = copy(b, pl[5:])
+				n = copy(b, layer.payload.Payload()[5:])
 			} else {
-				n = copy(b, pl)
+				n = copy(b, layer.payload.Payload())
 			}
 			conn.trySendAck(conn.layer)
 		}
