@@ -98,7 +98,7 @@ func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 	}
 	if(parser == nil){
 		parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet)
-		parser.SetDecodingLayerContainer(gopacket.DecodingLayerSparse(nil))
+		parser.SetDecodingLayerContainer(gopacket.DecodingLayerArray(nil))
 		parser.AddDecodingLayer(&eth)
 		parser.AddDecodingLayer(&ip4)
 		parser.AddDecodingLayer(&tcp)
