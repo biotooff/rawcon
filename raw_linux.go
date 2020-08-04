@@ -602,19 +602,19 @@ func (r *Raw) ListenRAW(address string) (listener *RAWListener, err error) {
 		return
 	}
 	isAddrAny := udpaddr.IP.Equal(ipv4AddrAny)
-	// ipv4.NewPacketConn(conn).SetBPF([]bpf.RawInstruction{
-	// 	{0x30, 0, 0, 0x00000009},
-	// 	{0x15, 0, 8, 0x00000006},
-	// 	{0x28, 0, 0, 0x00000006},
-	// 	{0x45, 4, 0, 0x00001fff},
-	// 	{0xb1, 0, 0, 0x00000000},
-	// 	{0x48, 0, 0, 0x00000002},
-	// 	{0x15, 2, 3, uint32(udpaddr.Port)},
-	// 	{0x48, 0, 0, 0x00000000},
-	// 	{0x15, 0, 1, uint32(udpaddr.Port)},
-	// 	{0x6, 0, 0, 0x00040000},
-	// 	{0x6, 0, 0, 0x00000000},
-	// })
+	ipv4.NewPacketConn(conn).SetBPF([]bpf.RawInstruction{
+		{0x30, 0, 0, 0x00000009},
+		{0x15, 0, 8, 0x00000006},
+		{0x28, 0, 0, 0x00000006},
+		{0x45, 4, 0, 0x00001fff},
+		{0xb1, 0, 0, 0x00000000},
+		{0x48, 0, 0, 0x00000002},
+		{0x15, 2, 3, uint32(udpaddr.Port)},
+		{0x48, 0, 0, 0x00000000},
+		{0x15, 0, 1, uint32(udpaddr.Port)},
+		{0x6, 0, 0, 0x00040000},
+		{0x6, 0, 0, 0x00000000},
+	})
 	ipv4RawConn,_ := ipv4.NewRawConn(conn)
 	listener = &RAWListener{
 		RAWConn: RAWConn{
