@@ -21,6 +21,8 @@ import (
 	"github.com/google/gopacket/pcap"
 	"github.com/biotooff/rawcon/utils"
 	"github.com/google/gopacket"
+
+	"golang.org/x/net/ipv4"
 )
 
 const maxCapLimit int32 = 1600
@@ -587,9 +589,9 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 	}
 	tcpConn.SetDeadline(time.Time{})
 	tcpConn.SetKeepAlive(false)
+	ipv4.NewConn(tcpConn).SetTTL(0)
 	conn.tcp = tcpConn
 	//go io.Copy(ioutil.Discard, conn.tcp)
-	//ipv4.NewConn(tcpConn).SetTTL(0)
 	filter = "tcp and src host " + conn.layer.ip4.DstIP.String() +
 		" and src port " + strconv.Itoa(int(conn.layer.tcp.DstPort)) +
 		" and dst host " + conn.layer.ip4.SrcIP.String() +
