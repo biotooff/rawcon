@@ -28,6 +28,7 @@ import (
 const maxCapLimit int32 = 1600
 const maxCapTimeout time.Duration = pcap.BlockForever//time.Millisecond * 10//
 const maxLayersChanLen int32 = 2000
+const connectTimeout = 20// seconds
 var tcpHeaderPaddingArray []byte = []byte{0,0,0,0,0,0,0,0,0,0,0,0}
 
 type RAWConn struct {
@@ -123,7 +124,7 @@ func (conn *RAWConn) readLayers() (layer *pktLayers, err error) {
 		if err = parser.DecodeLayers(buffer, &decoded); err != nil {
 	      	conn.Close()
 	      	fmt.Println("Could not decode layers: ", err)
-	      	return
+	      	continue
 		}
 		if tcp.RST {
 			fmt.Println("RST recv",tcp.SrcPort,"->",tcp.DstPort)
@@ -546,7 +547,19 @@ func (r *Raw) dialRAWDummy(address string) (conn *RAWConn, err error) {
 		}
 		conn.SetReadDeadline(time.Now().Add(time.Millisecond * 500))
 		var layer *pktLayers
-		layer, err = conn.readLayers()
+		// timeout
+		timeoutChan := make(chan byte,1)
+		go func(){
+			layer, _ = conn.readLayers()
+			close(timeoutChan) 
+		}()
+		select {
+			case <-timeoutChan: break
+			case <-time.After(connectTimeout * time.Second):
+				err = errors.New("tcp connect timeout")
+				return 
+		}
+		//
 		if err != nil {
 			if e, ok := err.(net.Error); ok && e.Temporary() {
 				retry++
