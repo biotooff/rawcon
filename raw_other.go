@@ -29,7 +29,6 @@ const maxCapLimit int32 = 1600
 const maxCapTimeout time.Duration = pcap.BlockForever//time.Millisecond * 10//
 const maxLayersChanLen int32 = 2000
 const connectTimeout = 20// seconds
-var tcpHeaderPaddingArray []byte = []byte{0,0,0,0,0,0,0,0,0,0,0,0}
 
 type RAWConn struct {
 	udp        net.Conn
@@ -295,7 +294,6 @@ func (conn *RAWConn) writeWithLayer(b []byte, layer *pktLayers) (n int, err erro
 	layer.updateTCP()
 	layer.tcp.PSH = true
 	layer.tcp.ACK = true
-	layer.tcp.Padding = tcpHeaderPaddingArray
 	layer.payload = b
 	defer func() { layer.payload = nil }()
 	return n, conn.sendPacketWithLayer(layer)
